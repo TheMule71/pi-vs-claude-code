@@ -29,6 +29,7 @@ interface ExpertDef {
 	name: string;
 	description: string;
 	tools: string;
+	extensions: string[];
 	systemPrompt: string;
 	file: string;
 }
@@ -69,12 +70,23 @@ function parseAgentFile(filePath: string): ExpertDef | null {
 			name: frontmatter.name,
 			description: frontmatter.description || "",
 			tools: frontmatter.tools || "read,grep,find,ls",
+			extensions: frontmatter.extensions
+				? frontmatter.extensions.split(",").map((e) => e.trim()).filter(Boolean)
+				: [],
 			systemPrompt: match[2].trim(),
 			file: filePath,
 		};
 	} catch {
 		return null;
 	}
+}
+
+// ── Extension path resolution ────────────────────
+
+function resolveExtPath(ext: string, cwd: string): string {
+	if (ext.startsWith("npm:") || ext.startsWith("git:")) return ext;
+	if (ext.startsWith("/") || /^[A-Za-z]:[\/\\]/.test(ext)) return ext;
+	return resolve(cwd, ext);
 }
 
 // ── Expert card colors ────────────────────────────
@@ -281,6 +293,7 @@ export default function (pi: ExtensionAPI) {
 			"-p",
 			"--no-session",
 			"--no-extensions",
+			...state.def.extensions.flatMap((ext) => ["-e", resolveExtPath(ext, ctx.cwd)]),
 			"--model", model,
 			"--tools", state.def.tools,
 			"--thinking", "off",
@@ -531,7 +544,7 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 		handler: async (_args, _ctx) => {
 			widgetCtx = _ctx;
 			const lines = Array.from(experts.values())
-				.map(s => `${displayName(s.def.name)} (${s.status}, queries: ${s.queryCount}): ${s.def.description}`)
+				.map(s => `${displayName(s.def.name)} (${s.status}, queries: ${s.queryCount})${s.def.extensions.length ? ` [ext: ${s.def.extensions.join(", ")}]` : ""}: ${s.def.description}`)
 				.join("\n");
 			_ctx.ui.notify(lines || "No experts loaded", "info");
 		},
@@ -556,7 +569,7 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 
 	pi.on("before_agent_start", async (_event, _ctx) => {
 		const expertCatalog = Array.from(experts.values())
-			.map(s => `### ${displayName(s.def.name)}\n**Query as:** \`${s.def.name}\`\n${s.def.description}`)
+			.map(s => `### ${displayName(s.def.name)}\n**Query as:** \`${s.def.name}\`\n${s.def.description}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}`)
 			.join("\n\n");
 
 		const expertNames = Array.from(experts.values()).map(s => displayName(s.def.name)).join(", ");
