@@ -246,6 +246,21 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	// ── Shared expert prompt fragment ───────────
+
+	function loadCommonPrompt(cwd: string): string {
+		const paths = [
+			join(cwd, ".pi", "agents", "pi-pi", "common.md"),
+			join(cwd, ".pi", "agents", "pi-pi", "_common.md"),
+		];
+		for (const p of paths) {
+			if (existsSync(p)) {
+				try { return readFileSync(p, "utf-8").trim(); } catch {}
+			}
+		}
+		return "";
+	}
+
 	// ── Query Expert ─────────────────────────────
 
 	function queryExpert(
@@ -288,6 +303,11 @@ export default function (pi: ExtensionAPI) {
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: "openrouter/google/gemini-3-flash-preview";
 
+		const commonPrompt = loadCommonPrompt(ctx.cwd);
+		const fullSystemPrompt = commonPrompt
+			? `${commonPrompt}\n\n---\n\n${state.def.systemPrompt}`
+			: state.def.systemPrompt;
+
 		const args = [
 			"--mode", "json",
 			"-p",
@@ -297,7 +317,7 @@ export default function (pi: ExtensionAPI) {
 			"--model", model,
 			"--tools", state.def.tools,
 			"--thinking", "off",
-			"--append-system-prompt", state.def.systemPrompt,
+			"--append-system-prompt", fullSystemPrompt,
 			question,
 		];
 
