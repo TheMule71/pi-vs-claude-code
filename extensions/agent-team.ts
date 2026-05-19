@@ -31,6 +31,7 @@ interface AgentDef {
 	name: string;
 	description: string;
 	tools: string;
+	extensions: string[];
 	systemPrompt: string;
 	file: string;
 }
@@ -96,6 +97,9 @@ function parseAgentFile(filePath: string): AgentDef | null {
 			name: frontmatter.name,
 			description: frontmatter.description || "",
 			tools: frontmatter.tools || "read,grep,find,ls",
+			extensions: frontmatter.extensions
+				? frontmatter.extensions.split(",").map((e) =>	e.trim()).filter(Boolean)
+				: [],
 			systemPrompt: match[2].trim(),
 			file: filePath,
 		};
@@ -130,6 +134,14 @@ function scanAgentDirs(cwd: string): AgentDef[] {
 	}
 
 	return agents;
+}
+
+// ── Extension path resolution ────────────────────
+
+function resolveExtPath(ext: string, cwd: string): string {
+	if (ext.startsWith("npm:") || ext.startsWith("git:")) return ext;
+	if (ext.startsWith("/") || /^[A-Za-z]:[\/\\]/.test(ext)) return ext;
+	return resolve(cwd, ext);
 }
 
 // ── Extension ────────────────────────────────────
@@ -348,6 +360,7 @@ export default function (pi: ExtensionAPI) {
 			"--mode", "json",
 			"-p",
 			"--no-extensions",
+			...state.def.extensions.flatMap((ext) =>	["-e", resolveExtPath(ext, ctx.cwd)]),
 			"--model", model,
 			"--tools", state.def.tools,
 			"--thinking", "off",
@@ -596,7 +609,8 @@ export default function (pi: ExtensionAPI) {
 			const names = Array.from(agentStates.values())
 				.map(s => {
 					const session = s.sessionFile ? "resumed" : "new";
-					return `${displayName(s.def.name)} (${s.status}, ${session}, runs: ${s.runCount}): ${s.def.description}`;
+					const exts = s.def.extensions.length ? ` [ext: ${s.def.extensions.join(", ")}]` : "";
+					return `${displayName(s.def.name)} (${s.status}, ${session}, runs: ${s.runCount})${exts}: ${s.def.description}`;
 				})
 				.join("\n");
 			_ctx.ui.notify(names || "No agents loaded", "info");
@@ -631,7 +645,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (_event, _ctx) => {
 		// Build dynamic agent catalog from active team only
 		const agentCatalog = Array.from(agentStates.values())
-			.map(s => `### ${displayName(s.def.name)}\n**Dispatch as:** \`${s.def.name}\`\n${s.def.description}\n**Tools:** ${s.def.tools}`)
+			.map(s => `### ${displayName(s.def.name)}\n**Dispatch as:** \`${s.def.name}\`\n${s.def.description}\n**Tools:** ${s.def.tools}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}`)
 			.join("\n\n");
 
 		const teamMembers = Array.from(agentStates.values()).map(s => displayName(s.def.name)).join(", ");

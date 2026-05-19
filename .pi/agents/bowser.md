@@ -5,6 +5,7 @@ model: opus
 color: orange
 skills:
   - playwright-bowser
+extensions: git:github.com/fgrehm/pi-ollama-cloud
 ---
 
 # Playwright Bowser Agent
