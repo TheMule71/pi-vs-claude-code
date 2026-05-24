@@ -146,8 +146,12 @@ export default function (pi: ExtensionAPI) {
 	// ── Grid Rendering ───────────────────────────
 
 	function renderCard(state: ExpertState, colWidth: number, theme: any): string[] {
-		const w = colWidth - 2;
-		const truncate = (s: string, max: number) => s.length > max ? s.slice(0, max - 3) + "..." : s;
+		const w = Math.max(1, colWidth - 2);
+		const truncate = (s: string, max: number) => {
+			const cleaned = s.replace(/\t/g, "        ");  // Tab width 8
+			if (visibleWidth(cleaned) <= max) return cleaned;
+			return truncateToWidth(cleaned, Math.max(0, max - 3)) + "...";
+		};
 
 		const statusColor = state.status === "idle" ? "dim"
 			: state.status === "researching" ? "accent"
@@ -157,8 +161,9 @@ export default function (pi: ExtensionAPI) {
 			: state.status === "done" ? "✓" : "✗";
 
 		const name = displayName(state.def.name);
-		const nameStr = theme.fg("accent", theme.bold(truncate(name, w)));
-		const nameVisible = Math.min(name.length, w);
+		const nameTruncated = truncate(name, w);
+		const nameStr = theme.fg("accent", theme.bold(nameTruncated));
+		const nameVisible = visibleWidth(nameTruncated);
 
 		const statusStr = `${statusIcon} ${state.status}`;
 		const timeStr = state.status !== "idle" ? ` ${Math.round(state.elapsed / 1000)}s` : "";
@@ -169,12 +174,12 @@ export default function (pi: ExtensionAPI) {
 		const workRaw = state.question || state.def.description;
 		const workText = truncate(workRaw, Math.min(50, w - 1));
 		const workLine = theme.fg("muted", workText);
-		const workVisible = workText.length;
+		const workVisible = visibleWidth(workText);
 
 		const lastRaw = state.lastLine || "";
 		const lastText = truncate(lastRaw, Math.min(50, w - 1));
 		const lastLineRendered = lastText ? theme.fg("dim", lastText) : theme.fg("dim", "—");
-		const lastVisible = lastText ? lastText.length : 1;
+		const lastVisible = lastText ? visibleWidth(lastText) : 1;
 
 		const colors = EXPERT_COLORS[state.def.name];
 		const bg  = colors?.bg ?? "";
@@ -219,8 +224,8 @@ export default function (pi: ExtensionAPI) {
 
 					const cols = Math.min(gridCols, experts.size);
 					const gap = 1;
-					// avoid Text component's ANSI-width miscounting by returning raw lines
-					const colWidth = Math.floor((width - gap * (cols - 1)) / cols) - 1;
+					const rawColWidth = Math.floor((width - gap * (cols - 1)) / cols) - 1;
+					const colWidth = Math.max(8, rawColWidth);  // Minimum 8 for border + content
 					const allExperts = Array.from(experts.values());
 
 					const lines: string[] = [""]; // top margin
