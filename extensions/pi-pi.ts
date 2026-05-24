@@ -31,6 +31,7 @@ interface ExpertDef {
 	tools: string;
 	extensions: string[];
 	systemPrompt: string;
+	model?: string;      // Optional per-expert model override
 	file: string;
 }
 
@@ -73,6 +74,7 @@ function parseAgentFile(filePath: string): ExpertDef | null {
 			extensions: frontmatter.extensions
 				? frontmatter.extensions.split(",").map((e) => e.trim()).filter(Boolean)
 				: [],
+			model: frontmatter.model || undefined,
 			systemPrompt: match[2].trim(),
 			file: filePath,
 		};
@@ -272,6 +274,7 @@ export default function (pi: ExtensionAPI) {
 		expertName: string,
 		question: string,
 		ctx: any,
+		modelOverride?: string,
 	): Promise<{ output: string; exitCode: number; elapsed: number }> {
 		const key = expertName.toLowerCase();
 		const state = experts.get(key);
@@ -304,9 +307,11 @@ export default function (pi: ExtensionAPI) {
 			updateWidget();
 		}, 1000);
 
-		const model = ctx.model
-			? `${ctx.model.provider}/${ctx.model.id}`
-			: "openrouter/google/gemini-3-flash-preview";
+		const fallbackModel = "openrouter/google/gemini-3-flash-preview";
+		const sessionModelFlag = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : fallbackModel;
+
+		// Priority: tool param override > expert definition model > session model > fallback
+		const model = modelOverride || state.def.model || sessionModelFlag;
 
 		const commonPrompt = loadCommonPrompt(ctx.cwd);
 		const fullSystemPrompt = commonPrompt
@@ -437,13 +442,16 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 					question: Type.String({
 						description: "Specific question about what you need to build. Include context about the target component.",
 					}),
+					model: Type.Optional(Type.String({
+						description: "Override the model for this query. Format: provider/id (e.g. ollama-cloud/qwen3-coder-next). Uses expert default or session model if omitted.",
+					})),
 				}),
 				{ description: "Array of expert queries to run in parallel" },
 			),
 		}),
 
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-			const { queries } = params as { queries: { expert: string; question: string }[] };
+			const { queries } = params as { queries: { expert: string; question: string; model?: string }[] };
 
 			if (!queries || queries.length === 0) {
 				return {
@@ -463,8 +471,8 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 			// Launch ALL experts concurrently — allSettled so one failure
 			// never discards results from the others
 			const settled = await Promise.allSettled(
-				queries.map(async ({ expert, question }) => {
-					const result = await queryExpert(expert, question, ctx);
+				queries.map(async ({ expert, question, model }) => {
+					const result = await queryExpert(expert, question, ctx, model);
 					const truncated = result.output.length > 12000
 						? result.output.slice(0, 12000) + "\n\n... [truncated — ask follow-up for more]"
 						: result.output;
