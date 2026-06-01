@@ -19,7 +19,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
-import { readdirSync, readFileSync, existsSync, mkdirSync } from "fs";
+import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { join, resolve } from "path";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
@@ -332,6 +332,7 @@ export default function (pi: ExtensionAPI) {
 		];
 
 		const textChunks: string[] = [];
+		const stderrChunks: string[] = [];
 
 		return new Promise((resolve) => {
 			const proc = spawn("pi", args, {
@@ -359,13 +360,29 @@ export default function (pi: ExtensionAPI) {
 								state.lastLine = last;
 								updateWidget();
 							}
+						} else if (event.type === "message_end") {
+							const msg = event.message;
+							// Fallback: if text_deltas missed content, grab full text from final message
+							if (msg?.content && textChunks.join("").length === 0) {
+								const fullText = msg.content
+									.filter((c: any) => c.type === "text")
+									.map((c: any) => c.text || "")
+									.join("");
+								if (fullText) textChunks.push(fullText);
+							}
 						}
 					} catch {}
 				}
 			});
 
 			proc.stderr!.setEncoding("utf-8");
-			proc.stderr!.on("data", () => {});
+			proc.stderr!.on("data", (chunk: string) => {
+				const MAX_STDERR = 1024 * 1024; // 1 MB cap
+				const total = stderrChunks.reduce((sum, c) => sum + c.length, 0);
+				if (total < MAX_STDERR) {
+					stderrChunks.push(chunk);
+				}
+			});
 
 			proc.on("close", (code) => {
 				if (buffer.trim()) {
@@ -385,6 +402,19 @@ export default function (pi: ExtensionAPI) {
 				const full = textChunks.join("");
 				state.lastLine = full.split("\n").filter((l: string) => l.trim()).pop() || "";
 				updateWidget();
+
+				// Persist full output to disk so the orchestrator can re-read it later
+				try {
+					const outputDir = join(ctx.cwd, ".pi", "outputs");
+					if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
+					const expertKey = state.def.name.toLowerCase().replace(/\s+/g, "-");
+					const outputPath = join(outputDir, `${expertKey}.md`);
+					let outputBody = full;
+					if (stderrChunks.length > 0) {
+						outputBody += "\n\n--- stderr ---\n" + stderrChunks.join("");
+					}
+					writeFileSync(outputPath, outputBody, "utf-8");
+				} catch {}
 
 				ctx.ui.notify(
 					`${displayName(state.def.name)} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
@@ -473,9 +503,16 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 			const settled = await Promise.allSettled(
 				queries.map(async ({ expert, question, model }) => {
 					const result = await queryExpert(expert, question, ctx, model);
-					const truncated = result.output.length > 12000
-						? result.output.slice(0, 12000) + "\n\n... [truncated — ask follow-up for more]"
-						: result.output;
+					const expertKey = expert.toLowerCase().replace(/\s+/g, "-");
+					const outputDir = join(ctx.cwd, ".pi", "outputs");
+					const outputPath = join(outputDir, `${expertKey}.md`);
+					const MAX_PREVIEW = 2500;
+					let preview = result.output;
+					if (result.output.length > MAX_PREVIEW) {
+						const idx = result.output.lastIndexOf("\n", MAX_PREVIEW);
+						const cutAt = idx > 0 ? idx : MAX_PREVIEW;
+						preview = result.output.slice(0, cutAt) + "\n\n... [truncated]";
+					}
 					const status = result.exitCode === 0 ? "done" : "error";
 					return {
 						expert,
@@ -483,8 +520,9 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 						status,
 						elapsed: result.elapsed,
 						exitCode: result.exitCode,
-						output: truncated,
+						output: `${preview}\n\n[Full output: ${outputPath}]`,
 						fullOutput: result.output,
+						outputPath,
 					};
 				}),
 			);
@@ -559,7 +597,7 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 			if (options.expanded && details.results) {
 				const expanded = (details.results as any[]).map((r: any) => {
 					const output = r.fullOutput
-						? (r.fullOutput.length > 4000 ? r.fullOutput.slice(0, 4000) + "\n... [truncated]" : r.fullOutput)
+						? (r.fullOutput.length > 12000 ? r.fullOutput.slice(0, 12000) + "\n... [truncated]" : r.fullOutput)
 						: r.output || "";
 					return theme.fg("accent", `── ${displayName(r.expert)} ──`) + "\n" + theme.fg("muted", output);
 				});
@@ -618,6 +656,11 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 				.replace("{{EXPERT_COUNT}}", experts.size.toString())
 				.replace("{{EXPERT_NAMES}}", expertNames)
 				.replace("{{EXPERT_CATALOG}}", expertCatalog);
+
+			// Append instruction about retrieving full expert outputs from disk
+			systemPrompt += `
+## Retrieving Full Expert Outputs
+Expert responses may be summarized in tool results. When you need the complete documentation from any expert, use your built-in \`read()\` tool on the file path shown in the result (e.g. \`.pi/outputs/ext-expert.md\`). Do NOT dispatch another agent just to read a file — your native \`read()\` tool reaches the filesystem directly.`;
 		} catch (err) {
 			systemPrompt = "Error: Could not load pi-orchestrator.md. Make sure it exists in .pi/agents/pi-pi/.";
 		}

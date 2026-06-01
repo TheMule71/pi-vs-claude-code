@@ -21,7 +21,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text, type AutocompleteItem, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
-import { readdirSync, readFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
+import { readdirSync, readFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "fs";
 import { join, resolve } from "path";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
@@ -154,6 +154,7 @@ export default function (pi: ExtensionAPI) {
 	let gridCols = 2;
 	let widgetCtx: any;
 	let sessionDir = "";
+	let outputBaseDir = "";
 	let contextWindow = 0;
 
 	function loadAgents(cwd: string) {
@@ -161,6 +162,10 @@ export default function (pi: ExtensionAPI) {
 		sessionDir = join(cwd, ".pi", "agent-sessions");
 		if (!existsSync(sessionDir)) {
 			mkdirSync(sessionDir, { recursive: true });
+		}
+		outputBaseDir = join(cwd, ".pi", "outputs");
+		if (!existsSync(outputBaseDir)) {
+			mkdirSync(outputBaseDir, { recursive: true });
 		}
 
 		// Load all agent definitions
@@ -376,6 +381,7 @@ export default function (pi: ExtensionAPI) {
 		args.push(task);
 
 		const textChunks: string[] = [];
+		const stderrChunks: string[] = [];
 
 		return new Promise((resolve) => {
 			const proc = spawn("pi", args, {
@@ -412,6 +418,14 @@ export default function (pi: ExtensionAPI) {
 								state.contextPct = ((msg.usage.input || 0) / contextWindow) * 100;
 								updateWidget();
 							}
+							// Fallback: if text_deltas missed content, grab full text from final message
+							if (msg?.content && textChunks.join("").length === 0) {
+								const fullText = msg.content
+									.filter((c: any) => c.type === "text")
+									.map((c: any) => c.text || "")
+									.join("");
+								if (fullText) textChunks.push(fullText);
+							}
 						} else if (event.type === "agent_end") {
 							const msgs = event.messages || [];
 							const last = [...msgs].reverse().find((m: any) => m.role === "assistant");
@@ -425,7 +439,13 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.stderr!.setEncoding("utf-8");
-			proc.stderr!.on("data", () => {});
+			proc.stderr!.on("data", (chunk: string) => {
+				const MAX_STDERR = 1024 * 1024; // 1 MB cap
+				const total = stderrChunks.reduce((sum, c) => sum + c.length, 0);
+				if (total < MAX_STDERR) {
+					stderrChunks.push(chunk);
+				}
+			});
 
 			proc.on("close", (code) => {
 				if (buffer.trim()) {
@@ -450,6 +470,17 @@ export default function (pi: ExtensionAPI) {
 				const full = textChunks.join("");
 				state.lastWork = full.split("\n").filter((l: string) => l.trim()).pop() || "";
 				updateWidget();
+
+				// Persist full output to disk for the orchestrator to inspect
+				try {
+					if (!existsSync(outputBaseDir)) mkdirSync(outputBaseDir, { recursive: true });
+					const outputPath = join(outputBaseDir, `${agentKey}.md`);
+					let outputBody = full;
+					if (stderrChunks.length > 0) {
+						outputBody += "\n\n--- stderr ---\n" + stderrChunks.join("");
+					}
+					writeFileSync(outputPath, outputBody, "utf-8");
+				} catch {}
 
 				ctx.ui.notify(
 					`${displayName(state.def.name)} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
@@ -501,15 +532,21 @@ export default function (pi: ExtensionAPI) {
 
 				const result = await dispatchAgent(agent, task, ctx);
 
-				const truncated = result.output.length > 8000
-					? result.output.slice(0, 8000) + "\n\n... [truncated]"
-					: result.output;
+				const agentKey = agent.toLowerCase().replace(/\s+/g, "-");
+				const outputPath = join(outputBaseDir, `${agentKey}.md`);
+				const MAX_PREVIEW = 2500;
+				let preview = result.output;
+				if (result.output.length > MAX_PREVIEW) {
+					const idx = result.output.lastIndexOf("\n", MAX_PREVIEW);
+					const cutAt = idx > 0 ? idx : MAX_PREVIEW;
+					preview = result.output.slice(0, cutAt) + "\n\n... [truncated]";
+				}
 
 				const status = result.exitCode === 0 ? "done" : "error";
 				const summary = `[${agent}] ${status} in ${Math.round(result.elapsed / 1000)}s`;
 
 				return {
-					content: [{ type: "text", text: `${summary}\n\n${truncated}` }],
+					content: [{ type: "text", text: `${summary}\n\n${preview}\n\n[Full output: ${outputPath}]` }],
 					details: {
 						agent,
 						task,
@@ -517,12 +554,13 @@ export default function (pi: ExtensionAPI) {
 						elapsed: result.elapsed,
 						exitCode: result.exitCode,
 						fullOutput: result.output,
+						outputPath,
 					},
 				};
 			} catch (err: any) {
 				return {
 					content: [{ type: "text", text: `Error dispatching to ${agent}: ${err?.message || err}` }],
-					details: { agent, task, status: "error", elapsed: 0, exitCode: 1, fullOutput: "" },
+					details: { agent, task, status: "error", elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
 				};
 			}
 		},
@@ -563,13 +601,83 @@ export default function (pi: ExtensionAPI) {
 				theme.fg("dim", ` ${elapsed}s`);
 
 			if (options.expanded && details.fullOutput) {
-				const output = details.fullOutput.length > 4000
-					? details.fullOutput.slice(0, 4000) + "\n... [truncated]"
+				const output = details.fullOutput.length > 12000
+					? details.fullOutput.slice(0, 12000) + "\n... [truncated]"
 					: details.fullOutput;
 				return new Text(header + "\n" + theme.fg("muted", output), 0, 0);
 			}
 
 			return new Text(header, 0, 0);
+		},
+	});
+
+	// ── read_agent_output Tool ──
+
+	pi.registerTool({
+		name: "read_agent_output",
+		label: "Read Agent Output",
+		description: "Read the full saved output file of a completed specialist agent directly from disk. Use this to inspect long outputs without dispatching another agent.",
+		parameters: Type.Object({
+			agent: Type.String({ description: "Agent name (case-insensitive)" }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const { agent } = params as { agent: string };
+			const agentKey = agent.toLowerCase().replace(/\s+/g, "-");
+			const outputPath = join(outputBaseDir, `${agentKey}.md`);
+
+			if (!existsSync(outputPath)) {
+				return {
+					content: [{ type: "text", text: `No output file found for agent "${agent}" at ${outputPath}.` }],
+					details: { agent, outputPath, found: false },
+				};
+			}
+
+			const MAX_BYTES = 50 * 1024; // 50 KB — matches Pi's internal tool cap
+			let full = readFileSync(outputPath, "utf-8");
+			const truncated = Buffer.byteLength(full, "utf-8") > MAX_BYTES;
+			if (truncated) {
+				const half = Math.floor(MAX_BYTES / 2);
+				const enc = new TextEncoder();
+				const bytes = enc.encode(full);
+				const head = new TextDecoder().decode(bytes.slice(0, half));
+				const tail = new TextDecoder().decode(bytes.slice(-half));
+				full = `${head}\n\n... [output truncated by extension; middle omitted] ...\n\n${tail}`;
+			}
+
+			return {
+				content: [{ type: "text", text: full }],
+				details: { agent, outputPath, found: true, truncated },
+			};
+		},
+
+		renderCall(args, theme) {
+			const agentName = (args as any).agent || "?";
+			return new Text(
+				theme.fg("toolTitle", theme.bold("read_agent_output ")) +
+				theme.fg("accent", agentName),
+				0, 0,
+			);
+		},
+
+		renderResult(result, options, theme) {
+			const details = (result.details || {}) as any;
+			if (options.isPartial) {
+				return new Text(theme.fg("accent", "● read_agent_output") + theme.fg("dim", " working..."), 0, 0);
+			}
+			const text = result.content[0];
+			if (!details.found) {
+				return new Text(theme.fg("error", `✗ ${details.agent || "?"} — not found`), 0, 0);
+			}
+			if (options.expanded && text?.type === "text") {
+				const output = details.truncated
+					? text.text
+					: text.text.length > 12000
+					? text.text.slice(0, 12000) + "\n... [truncated]"
+					: text.text;
+				return new Text(theme.fg("success", `✓ ${details.agent}`) + "\n" + theme.fg("muted", output), 0, 0);
+			}
+			return new Text(theme.fg("success", `✓ ${details.agent}`) + theme.fg("dim", " output loaded"), 0, 0);
 		},
 	});
 
@@ -667,6 +775,9 @@ You can ONLY dispatch to agents listed below. Do not attempt to dispatch to agen
 - If a task fails, try a different agent or adjust the task description
 - Summarize the outcome for the user
 
+## Retrieving Agent Outputs
+Specialist agents may return long outputs. When you need the full text of a previously dispatched agent, use the read_agent_output tool directly (do NOT dispatch another agent just to read a file). The tool returns the complete saved output up to the system limit; if it is truncated you will see a middle-ellipsis note.
+
 ## Rules
 - NEVER try to read, write, or execute code directly — you have no such tools
 - ALWAYS use dispatch_agent to get work done
@@ -709,8 +820,8 @@ ${agentCatalog}`,
 			activateTeam(teamNames[0]);
 		}
 
-		// Lock down to dispatcher-only (tool already registered at top level)
-		pi.setActiveTools(["dispatch_agent"]);
+		// Dispatcher tools available to orchestrator
+		pi.setActiveTools(["dispatch_agent", "read_agent_output"]);
 
 		_ctx.ui.setStatus("agent-team", `Team: ${activeTeamName} (${agentStates.size})`);
 		const members = Array.from(agentStates.values()).map(s => displayName(s.def.name)).join(", ");
