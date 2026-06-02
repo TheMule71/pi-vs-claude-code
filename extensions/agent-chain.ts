@@ -333,7 +333,12 @@ export default function (pi: ExtensionAPI) {
 		task: string,
 		stepIndex: number,
 		ctx: any,
+		signal?: AbortSignal,
 	): Promise<{ output: string; exitCode: number; elapsed: number }> {
+		// Bail out immediately if already cancelled
+		if (signal?.aborted) {
+			return Promise.resolve({ output: "Cancelled", exitCode: 1, elapsed: 0 });
+		}
 		const model = ctx.model
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: "openrouter/google/gemini-3-flash-preview";
@@ -363,7 +368,7 @@ export default function (pi: ExtensionAPI) {
 		const startTime = Date.now();
 		const state = stepStates[stepIndex];
 
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
 			const proc = spawn("pi", args, {
 				stdio: ["ignore", "pipe", "pipe"],
 				env: { ...process.env },
@@ -373,6 +378,16 @@ export default function (pi: ExtensionAPI) {
 				state.elapsed = Date.now() - startTime;
 				updateWidget();
 			}, 1000);
+
+			// Kill the child process when the user presses Escape (abort signal fires)
+			const onAbort = () => {
+				clearInterval(timer);
+				proc.kill("SIGTERM");
+				state.status = "error";
+				state.lastWork = "Cancelled by user";
+				updateWidget();
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
 
 			let buffer = "";
 
@@ -403,6 +418,8 @@ export default function (pi: ExtensionAPI) {
 			proc.stderr!.on("data", () => {});
 
 			proc.on("close", (code) => {
+				signal?.removeEventListener("abort", onAbort);
+
 				if (buffer.trim()) {
 					try {
 						const event = JSON.parse(buffer);
@@ -419,6 +436,11 @@ export default function (pi: ExtensionAPI) {
 				const output = textChunks.join("");
 				state.lastWork = output.split("\n").filter((l: string) => l.trim()).pop() || "";
 
+				if (signal?.aborted) {
+					reject(new Error("aborted"));
+					return;
+				}
+
 				if (code === 0) {
 					agentSessions.set(agentKey, agentSessionFile);
 				}
@@ -427,6 +449,7 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("error", (err) => {
+				signal?.removeEventListener("abort", onAbort);
 				clearInterval(timer);
 				resolve({
 					output: `Error spawning agent: ${err.message}`,
@@ -442,7 +465,8 @@ export default function (pi: ExtensionAPI) {
 	async function runChain(
 		task: string,
 		ctx: any,
-	): Promise<{ output: string; success: boolean; elapsed: number }> {
+		signal?: AbortSignal,
+	): Promise<{ output: string; success: boolean; elapsed: number; cancelled?: boolean }> {
 		if (!activeChain) {
 			return { output: "No chain active", success: false, elapsed: 0 };
 		}
@@ -462,6 +486,22 @@ export default function (pi: ExtensionAPI) {
 		const originalPrompt = task;
 
 		for (let i = 0; i < activeChain.steps.length; i++) {
+			// Don't start a new step if the user already cancelled
+			if (signal?.aborted) {
+				// Mark remaining steps as cancelled
+				for (let j = i; j < activeChain.steps.length; j++) {
+					stepStates[j].status = "error";
+					stepStates[j].lastWork = "Cancelled";
+				}
+				updateWidget();
+				return {
+					output: `Chain cancelled at step ${i + 1} by user.`,
+					success: false,
+					elapsed: Date.now() - chainStart,
+					cancelled: true,
+				};
+			}
+
 			const step = activeChain.steps[i];
 			stepStates[i].status = "running";
 			updateWidget();
@@ -482,7 +522,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const result = await runAgent(agentDef, resolvedPrompt, i, ctx);
+			const result = await runAgent(agentDef, resolvedPrompt, i, ctx, signal);
 
 			if (result.exitCode !== 0) {
 				stepStates[i].status = "error";
@@ -513,7 +553,7 @@ export default function (pi: ExtensionAPI) {
 			task: Type.String({ description: "The task/prompt for the chain to process" }),
 		}),
 
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { task } = params as { task: string };
 
 			if (onUpdate) {
@@ -523,25 +563,42 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 
-			const result = await runChain(task, ctx);
+			try {
+				const result = await runChain(task, ctx, signal);
 
-			const truncated = result.output.length > 8000
-				? result.output.slice(0, 8000) + "\n\n... [truncated]"
+				const truncated = result.output.length > 8000
+					? result.output.slice(0, 8000) + "\n\n... [truncated]"
 				: result.output;
 
-			const status = result.success ? "done" : "error";
-			const summary = `[chain:${activeChain?.name}] ${status} in ${Math.round(result.elapsed / 1000)}s`;
+				const status = result.cancelled ? "cancelled" : result.success ? "done" : "error";
+				const summary = result.cancelled
+					? `[chain:${activeChain?.name}] cancelled after ${Math.round(result.elapsed / 1000)}s`
+					: `[chain:${activeChain?.name}] ${status} in ${Math.round(result.elapsed / 1000)}s`;
 
-			return {
-				content: [{ type: "text", text: `${summary}\n\n${truncated}` }],
-				details: {
-					chain: activeChain?.name,
-					task,
-					status,
-					elapsed: result.elapsed,
-					fullOutput: result.output,
-				},
-			};
+				return {
+					content: [{ type: "text", text: `${summary}\n\n${truncated}` }],
+					details: {
+						chain: activeChain?.name,
+						task,
+						status,
+						elapsed: result.elapsed,
+						fullOutput: result.output,
+					},
+				};
+			} catch (e) {
+				if (signal?.aborted) {
+					return {
+						content: [{ type: "text", text: "Chain cancelled by user." }],
+						details: {
+							chain: activeChain?.name,
+							task,
+							status: "cancelled",
+							elapsed: 0,
+						},
+					};
+				}
+				throw e;
+			}
 		},
 
 		renderCall(args, theme) {
@@ -571,8 +628,8 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const icon = details.status === "done" ? "✓" : "✗";
-			const color = details.status === "done" ? "success" : "error";
+			const icon = details.status === "done" ? "✓" : details.status === "cancelled" ? "⊘" : "✗";
+			const color = details.status === "done" ? "success" : details.status === "cancelled" ? "warning" : "error";
 			const elapsed = typeof details.elapsed === "number" ? Math.round(details.elapsed / 1000) : 0;
 			const header = theme.fg(color, `${icon} ${details.chain}`) +
 				theme.fg("dim", ` ${elapsed}s`);
