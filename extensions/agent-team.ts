@@ -33,6 +33,7 @@ interface AgentDef {
 	tools: string;
 	extensions: string[];
 	systemPrompt: string;
+	model?: string;      // Optional per-agent model override (e.g. "google/gemini-2.5-pro")
 	file: string;
 }
 
@@ -100,6 +101,7 @@ function parseAgentFile(filePath: string): AgentDef | null {
 			extensions: frontmatter.extensions
 				? frontmatter.extensions.split(",").map((e) =>	e.trim()).filter(Boolean)
 				: [],
+			model: frontmatter.model || undefined,
 			systemPrompt: match[2].trim(),
 			file: filePath,
 		};
@@ -221,8 +223,12 @@ export default function (pi: ExtensionAPI) {
 	// ── Grid Rendering ───────────────────────────
 
 	function renderCard(state: AgentState, colWidth: number, theme: any): string[] {
-		const w = colWidth - 2;
-		const truncate = (s: string, max: number) => s.length > max ? s.slice(0, max - 3) + "..." : s;
+		const w = Math.max(1, colWidth - 2);  // Guard against negative/zero
+		const truncate = (s: string, max: number) => {
+			const cleaned = s.replace(/\t/g, "        ");  // Tab width 8, not 2
+			if (visibleWidth(cleaned) <= max) return cleaned;
+			return truncateToWidth(cleaned, Math.max(0, max - 3)) + "...";
+		};
 
 		const statusColor = state.status === "idle" ? "dim"
 			: state.status === "running" ? "accent"
@@ -232,27 +238,28 @@ export default function (pi: ExtensionAPI) {
 			: state.status === "done" ? "✓" : "✗";
 
 		const name = displayName(state.def.name);
-		const nameStr = theme.fg("accent", theme.bold(truncate(name, w)));
-		const nameVisible = Math.min(name.length, w);
+		const nameTruncated = truncate(name, w);
+		const nameStr = theme.fg("accent", theme.bold(nameTruncated));
+		const nameVisible = 1 + visibleWidth(nameTruncated);  // Include leading space
 
 		const statusStr = `${statusIcon} ${state.status}`;
 		const timeStr = state.status !== "idle" ? ` ${Math.round(state.elapsed / 1000)}s` : "";
 		const statusLine = theme.fg(statusColor, statusStr + timeStr);
-		const statusVisible = statusStr.length + timeStr.length;
+		const statusVisible = 1 + statusStr.length + timeStr.length;
 
 		// Context bar: 5 blocks + percent
 		const filled = Math.ceil(state.contextPct / 20);
 		const bar = "#".repeat(filled) + "-".repeat(5 - filled);
 		const ctxStr = `[${bar}] ${Math.ceil(state.contextPct)}%`;
 		const ctxLine = theme.fg("dim", ctxStr);
-		const ctxVisible = ctxStr.length;
+		const ctxVisible = 1 + ctxStr.length;
 
 		const workRaw = state.task
 			? (state.lastWork || state.task)
 			: state.def.description;
 		const workText = truncate(workRaw, Math.min(50, w - 1));
 		const workLine = theme.fg("muted", workText);
-		const workVisible = workText.length;
+		const workVisible = 1 + visibleWidth(workText);
 
 		const top = "┌" + "─".repeat(w) + "┐";
 		const bot = "└" + "─".repeat(w) + "┘";
@@ -261,10 +268,10 @@ export default function (pi: ExtensionAPI) {
 
 		return [
 			theme.fg("dim", top),
-			border(" " + nameStr, 1 + nameVisible),
-			border(" " + statusLine, 1 + statusVisible),
-			border(" " + ctxLine, 1 + ctxVisible),
-			border(" " + workLine, 1 + workVisible),
+			border(" " + nameStr, nameVisible),
+			border(" " + statusLine, statusVisible),
+			border(" " + ctxLine, ctxVisible),
+			border(" " + workLine, workVisible),
 			theme.fg("dim", bot),
 		];
 	}
@@ -284,7 +291,8 @@ export default function (pi: ExtensionAPI) {
 
 					const cols = Math.min(gridCols, agentStates.size);
 					const gap = 1;
-					const colWidth = Math.floor((width - gap * (cols - 1)) / cols);
+					const rawColWidth = Math.floor((width - gap * (cols - 1)) / cols);
+				const colWidth = Math.max(8, rawColWidth);  // Minimum 8 for border + name
 					const agents = Array.from(agentStates.values());
 					const rows: string[][] = [];
 
@@ -319,6 +327,7 @@ export default function (pi: ExtensionAPI) {
 		agentName: string,
 		task: string,
 		ctx: any,
+		modelOverride?: string,
 		signal?: AbortSignal,
 	): Promise<{ output: string; exitCode: number; elapsed: number }> {
 		// Bail out immediately if already cancelled
@@ -357,9 +366,11 @@ export default function (pi: ExtensionAPI) {
 			updateWidget();
 		}, 1000);
 
-		const model = ctx.model
-			? `${ctx.model.provider}/${ctx.model.id}`
-			: "openrouter/google/gemini-3-flash-preview";
+		const fallbackModel = "openrouter/google/gemini-3-flash-preview";
+		const sessionModelFlag = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : fallbackModel;
+
+		// Priority: tool param override > agent definition model > session model > fallback
+		const model = modelOverride || state.def.model || sessionModelFlag;
 
 		// Session file for this agent
 		const agentKey = state.def.name.toLowerCase().replace(/\s+/g, "-");
@@ -544,10 +555,11 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			agent: Type.String({ description: "Agent name (case-insensitive)" }),
 			task: Type.String({ description: "Task description for the agent to execute" }),
+			model: Type.Optional(Type.String({ description: "Override the model for this dispatch. Format: provider/id (e.g. google/gemini-2.5-pro). Uses agent default or session model if omitted." })),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const { agent, task } = params as { agent: string; task: string };
+			const { agent, task, model } = params as { agent: string; task: string; model?: string };
 
 			try {
 				if (onUpdate) {
@@ -557,7 +569,7 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				const result = await dispatchAgent(agent, task, ctx, signal);
+				const result = await dispatchAgent(agent, task, ctx, model, signal);
 
 				const agentKey = agent.toLowerCase().replace(/\s+/g, "-");
 				const outputPath = join(outputBaseDir, `${agentKey}.md`);
