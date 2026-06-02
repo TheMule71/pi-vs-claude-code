@@ -319,7 +319,12 @@ export default function (pi: ExtensionAPI) {
 		agentName: string,
 		task: string,
 		ctx: any,
+		signal?: AbortSignal,
 	): Promise<{ output: string; exitCode: number; elapsed: number }> {
+		// Bail out immediately if already cancelled
+		if (signal?.aborted) {
+			return Promise.resolve({ output: "Cancelled", exitCode: 1, elapsed: 0 });
+		}
 		const key = agentName.toLowerCase();
 		const state = agentStates.get(key);
 		if (!state) {
@@ -383,11 +388,21 @@ export default function (pi: ExtensionAPI) {
 		const textChunks: string[] = [];
 		const stderrChunks: string[] = [];
 
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
 			const proc = spawn("pi", args, {
 				stdio: ["ignore", "pipe", "pipe"],
 				env: { ...process.env },
 			});
+
+			// Kill the child process when the user presses Escape (abort signal fires)
+			const onAbort = () => {
+				clearInterval(state.timer);
+				proc.kill("SIGTERM");
+				state.status = "error";
+				state.lastWork = "Cancelled by user";
+				updateWidget();
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
 
 			let buffer = "";
 
@@ -448,6 +463,8 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("close", (code) => {
+				signal?.removeEventListener("abort", onAbort);
+
 				if (buffer.trim()) {
 					try {
 						const event = JSON.parse(buffer);
@@ -460,6 +477,15 @@ export default function (pi: ExtensionAPI) {
 
 				clearInterval(state.timer);
 				state.elapsed = Date.now() - startTime;
+
+				if (signal?.aborted) {
+					state.status = "error";
+					state.lastWork = "Cancelled by user";
+					updateWidget();
+					reject(new Error("aborted"));
+					return;
+				}
+
 				state.status = code === 0 ? "done" : "error";
 
 				// Mark session file as available for resume
@@ -495,6 +521,7 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("error", (err) => {
+				signal?.removeEventListener("abort", onAbort);
 				clearInterval(state.timer);
 				state.status = "error";
 				state.lastWork = `Error: ${err.message}`;
@@ -519,7 +546,7 @@ export default function (pi: ExtensionAPI) {
 			task: Type.String({ description: "Task description for the agent to execute" }),
 		}),
 
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { agent, task } = params as { agent: string; task: string };
 
 			try {
@@ -530,7 +557,7 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				const result = await dispatchAgent(agent, task, ctx);
+				const result = await dispatchAgent(agent, task, ctx, signal);
 
 				const agentKey = agent.toLowerCase().replace(/\s+/g, "-");
 				const outputPath = join(outputBaseDir, `${agentKey}.md`);
@@ -558,6 +585,12 @@ export default function (pi: ExtensionAPI) {
 					},
 				};
 			} catch (err: any) {
+				if (signal?.aborted) {
+					return {
+						content: [{ type: "text", text: `Agent ${agent} cancelled by user.` }],
+						details: { agent, task, status: "cancelled", elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
+					};
+				}
 				return {
 					content: [{ type: "text", text: `Error dispatching to ${agent}: ${err?.message || err}` }],
 					details: { agent, task, status: "error", elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
@@ -594,8 +627,8 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const icon = details.status === "done" ? "✓" : "✗";
-			const color = details.status === "done" ? "success" : "error";
+			const icon = details.status === "done" ? "✓" : details.status === "cancelled" ? "⊘" : "✗";
+			const color = details.status === "done" ? "success" : details.status === "cancelled" ? "warning" : "error";
 			const elapsed = typeof details.elapsed === "number" ? Math.round(details.elapsed / 1000) : 0;
 			const header = theme.fg(color, `${icon} ${details.agent}`) +
 				theme.fg("dim", ` ${elapsed}s`);
