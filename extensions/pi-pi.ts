@@ -11,6 +11,7 @@
  * Commands:
  *   /experts          — list available experts and their status
  *   /experts-grid N   — set dashboard column count (default 3)
+ *   /experts-model    — set or clear session-wide model override for an expert
  *
  * Usage: pi -e extensions/pi-pi.ts
  */
@@ -31,7 +32,7 @@ interface ExpertDef {
 	tools: string;
 	extensions: string[];
 	systemPrompt: string;
-	model?: string;      // Optional per-expert model override
+	model?: string;      // Optional per-expert model defined in .md frontmatter
 	file: string;
 }
 
@@ -42,6 +43,8 @@ interface ExpertState {
 	elapsed: number;
 	lastLine: string;
 	queryCount: number;
+	runtimeModel?: string; // Session-wide override chosen by the orchestrator
+	runningModel?: string; // Model currently being used (only when status === "researching")
 	timer?: ReturnType<typeof setInterval>;
 }
 
@@ -49,6 +52,12 @@ interface ExpertState {
 
 function displayName(name: string): string {
 	return name.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+function stripProvider(modelId?: string): string {
+	if (!modelId) return "default";
+	const parts = modelId.split('/');
+	return parts[parts.length - 1];
 }
 
 function parseAgentFile(filePath: string): ExpertDef | null {
@@ -162,10 +171,24 @@ export default function (pi: ExtensionAPI) {
 			: state.status === "researching" ? "◉"
 			: state.status === "done" ? "✓" : "✗";
 
-		const name = displayName(state.def.name);
-		const nameTruncated = truncate(name, w);
-		const nameStr = theme.fg("accent", theme.bold(nameTruncated));
-		const nameVisible = visibleWidth(nameTruncated);
+		const nameText = displayName(state.def.name);
+		const modelName = state.status === "researching"
+			? stripProvider(state.runningModel || state.runtimeModel || state.def.model || "default")
+			: stripProvider(state.runtimeModel || state.def.model || "default");
+		const sep = " — ";
+		const combined = nameText + sep + modelName;
+
+		let nameStr: string;
+		let nameVisible: number;
+
+		if (visibleWidth(combined) <= w) {
+			nameStr = theme.fg("accent", theme.bold(nameText)) + theme.fg("dim", sep + modelName);
+			nameVisible = visibleWidth(combined);
+		} else {
+			const truncated = truncate(nameText, w);
+			nameStr = theme.fg("accent", theme.bold(truncated));
+			nameVisible = visibleWidth(truncated);
+		}
 
 		const statusStr = `${statusIcon} ${state.status}`;
 		const timeStr = state.status !== "idle" ? ` ${Math.round(state.elapsed / 1000)}s` : "";
@@ -310,8 +333,9 @@ export default function (pi: ExtensionAPI) {
 		const fallbackModel = "openrouter/google/gemini-3-flash-preview";
 		const sessionModelFlag = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : fallbackModel;
 
-		// Priority: tool param override > expert definition model > session model > fallback
-		const model = modelOverride || state.def.model || sessionModelFlag;
+		// Priority: tool param override > runtime override > expert definition model > session model > fallback
+		const model = modelOverride || state.runtimeModel || state.def.model || sessionModelFlag;
+		state.runningModel = model;
 
 		const commonPrompt = loadCommonPrompt(ctx.cwd);
 		const fullSystemPrompt = commonPrompt
@@ -398,6 +422,7 @@ export default function (pi: ExtensionAPI) {
 				clearInterval(state.timer);
 				state.elapsed = Date.now() - startTime;
 				state.status = code === 0 ? "done" : "error";
+				state.runningModel = undefined;
 
 				const full = textChunks.join("");
 				state.lastLine = full.split("\n").filter((l: string) => l.trim()).pop() || "";
@@ -431,6 +456,7 @@ export default function (pi: ExtensionAPI) {
 			proc.on("error", (err) => {
 				clearInterval(state.timer);
 				state.status = "error";
+				state.runningModel = undefined;
 				state.lastLine = `Error: ${err.message}`;
 				updateWidget();
 				resolve({
@@ -460,20 +486,23 @@ Available experts:
 - prompt-expert: Prompt templates — single-file .md commands, arguments ($1, $@)
 - agent-expert: Agent definitions — .md personas, tools, teams.yaml, orchestration
 - keybinding-expert: Keyboard shortcuts — registerShortcut(), Key IDs, reserved keys, macOS terminal compatibility
+- cli-expert: CLI — command line arguments, flags, environment variables, subcommands
 
-Ask specific questions about what you need to BUILD. Each expert will return documentation excerpts, code patterns, and implementation guidance.`,
+Ask specific questions about what you need to BUILD. Each expert will return documentation excerpts, code patterns, and implementation guidance.
+
+You may optionally pass a \`model\` field per query to override the expert's default for that specific call.`,
 
 		parameters: Type.Object({
 			queries: Type.Array(
 				Type.Object({
 					expert: Type.String({
-						description: "Expert name: ext-expert, theme-expert, skill-expert, config-expert, tui-expert, prompt-expert, or agent-expert",
+						description: "Expert name: ext-expert, theme-expert, skill-expert, config-expert, tui-expert, prompt-expert, agent-expert, keybinding-expert, or cli-expert",
 					}),
 					question: Type.String({
 						description: "Specific question about what you need to build. Include context about the target component.",
 					}),
 					model: Type.Optional(Type.String({
-						description: "Override the model for this query. Format: provider/id (e.g. ollama-cloud/qwen3-coder-next). Uses expert default or session model if omitted.",
+						description: "Override the model for this query. Format: provider/id (e.g. ollama-cloud/qwen3-coder-next). Uses expert default, session override, or session model if omitted.",
 					})),
 				}),
 				{ description: "Array of expert queries to run in parallel" },
@@ -523,6 +552,7 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 						output: `${preview}\n\n[Full output: ${outputPath}]`,
 						fullOutput: result.output,
 						outputPath,
+						model, // record which model was used for this query
 					};
 				}),
 			);
@@ -538,13 +568,14 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 						exitCode: 1,
 						output: `Error: ${(s.reason as any)?.message || s.reason}`,
 						fullOutput: "",
+						model: queries[i].model,
 					},
 			);
 
 			// Build combined response
 			const sections = results.map(r => {
 				const icon = r.status === "done" ? "✓" : "✗";
-				return `## [${icon}] ${displayName(r.expert)} (${Math.round(r.elapsed / 1000)}s)\n\n${r.output}`;
+				return `## [${icon}] ${displayName(r.expert)} (${Math.round(r.elapsed / 1000)}s)${r.model ? ` — model: ${r.model}` : ""}\n\n${r.output}`;
 			});
 
 			return {
@@ -559,11 +590,13 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 		renderCall(args, theme) {
 			const queries = (args as any).queries || [];
 			const names = queries.map((q: any) => displayName(q.expert || "?")).join(", ");
+			const modelOverrides = queries.filter((q: any) => q.model).map((q: any) => q.model);
+			const modelHint = modelOverrides.length > 0 ? ` (model overrides: ${modelOverrides.join(", ")})` : "";
 			return new Text(
 				theme.fg("toolTitle", theme.bold("query_experts ")) +
 				theme.fg("accent", `${queries.length} parallel`) +
 				theme.fg("dim", " — ") +
-				theme.fg("muted", names),
+				theme.fg("muted", names + modelHint),
 				0, 0,
 			);
 		},
@@ -588,8 +621,9 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 				const icon = r.status === "done" ? "✓" : "✗";
 				const color = r.status === "done" ? "success" : "error";
 				const elapsed = typeof r.elapsed === "number" ? Math.round(r.elapsed / 1000) : 0;
+				const modelTag = r.model ? ` [${r.model}]` : "";
 				return theme.fg(color, `${icon} ${displayName(r.expert)}`) +
-					theme.fg("dim", ` ${elapsed}s`);
+					theme.fg("dim", ` ${elapsed}s${modelTag}`);
 			});
 
 			const header = lines.join(theme.fg("dim", " · "));
@@ -599,12 +633,81 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 					const output = r.fullOutput
 						? (r.fullOutput.length > 12000 ? r.fullOutput.slice(0, 12000) + "\n... [truncated]" : r.fullOutput)
 						: r.output || "";
-					return theme.fg("accent", `── ${displayName(r.expert)} ──`) + "\n" + theme.fg("muted", output);
+					const modelTag = r.model ? ` — model: ${r.model}` : "";
+					return theme.fg("accent", `── ${displayName(r.expert)}${modelTag} ──`) + "\n" + theme.fg("muted", output);
 				});
 				return new Text(header + "\n\n" + expanded.join("\n\n"), 0, 0);
 			}
 
 			return new Text(header, 0, 0);
+		},
+	});
+
+	// ── set_expert_model Tool ───────────────────
+
+	pi.registerTool({
+		name: "set_expert_model",
+		label: "Set Expert Model",
+		description: "Set or clear the session-wide default model for a specific expert. This affects all future query_experts calls unless a per-query model override is provided.",
+		parameters: Type.Object({
+			expert: Type.String({ description: "Expert name (case-insensitive)" }),
+			model: Type.Optional(Type.String({ description: "Model in provider/id format (e.g. openrouter/google/gemini-3-flash-preview). Omit to clear the override and revert to the .md default." })),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const { expert, model } = params as { expert: string; model?: string };
+			const key = expert.toLowerCase().replace(/\s+/g, "-");
+			const state = experts.get(key);
+
+			if (!state) {
+				const available = Array.from(experts.values()).map(s => s.def.name).join(", ");
+				return {
+					content: [{ type: "text", text: `Expert "${expert}" not found. Available: ${available}` }],
+					details: { expert, available, success: false },
+				};
+			}
+
+			const previous = state.runtimeModel || state.def.model || "session default";
+
+			if (model && model.trim()) {
+				state.runtimeModel = model.trim();
+			} else {
+				delete state.runtimeModel;
+			}
+
+			const current = state.runtimeModel || state.def.model || "session default";
+
+			return {
+				content: [{ type: "text", text: `Model for ${displayName(state.def.name)} changed from \`${previous}\` to \`${current}\`.` }],
+				details: { expert: state.def.name, previous, current, success: true },
+			};
+		},
+
+		renderCall(args, theme) {
+			const { expert, model } = args as any;
+			const action = model ? `→ ${model}` : "reset to default";
+			return new Text(
+				theme.fg("toolTitle", theme.bold("set_expert_model ")) +
+				theme.fg("accent", expert || "?") +
+				theme.fg("dim", " — ") +
+				theme.fg("muted", action),
+				0, 0,
+			);
+		},
+
+		renderResult(result, options, theme) {
+			const details = (result.details || {}) as any;
+			if (options.isPartial) {
+				return new Text(theme.fg("accent", "● set_expert_model") + theme.fg("dim", " working..."), 0, 0);
+			}
+			if (details.success) {
+				return new Text(
+					theme.fg("success", `✓ ${displayName(details.expert)}`) +
+					theme.fg("dim", ` → ${details.current}`),
+					0, 0,
+				);
+			}
+			return new Text(theme.fg("error", `✗ ${details.expert || "?"} — not found`), 0, 0);
 		},
 	});
 
@@ -615,7 +718,14 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 		handler: async (_args, _ctx) => {
 			widgetCtx = _ctx;
 			const lines = Array.from(experts.values())
-				.map(s => `${displayName(s.def.name)} (${s.status}, queries: ${s.queryCount})${s.def.extensions.length ? ` [ext: ${s.def.extensions.join(", ")}]` : ""}: ${s.def.description}`)
+				.map(s => {
+					const modelInfo = s.runtimeModel
+						? ` [runtime model: ${s.runtimeModel}]`
+						: s.def.model
+						? ` [default model: ${s.def.model}]`
+						: "";
+					return `${displayName(s.def.name)} (${s.status}, queries: ${s.queryCount})${s.def.extensions.length ? ` [ext: ${s.def.extensions.join(", ")}]` : ""}${modelInfo}: ${s.def.description}`;
+				})
 				.join("\n");
 			_ctx.ui.notify(lines || "No experts loaded", "info");
 		},
@@ -636,11 +746,46 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 		},
 	});
 
+	pi.registerCommand("experts-model", {
+		description: "Set or clear session-wide model for an expert: /experts-model <expert> [model]",
+		handler: async (args, _ctx) => {
+			widgetCtx = _ctx;
+			const parts = args?.trim().split(/\s+/) || [];
+			const expertName = parts[0];
+			const model = parts.slice(1).join(" ") || undefined;
+
+			if (!expertName) {
+				_ctx.ui.notify("Usage: /experts-model <expert> [model] — omit model to reset to .md default", "error");
+				return;
+			}
+
+			const key = expertName.toLowerCase().replace(/\s+/g, "-");
+			const state = experts.get(key);
+			if (!state) {
+				_ctx.ui.notify(`Expert "${expertName}" not found`, "error");
+				return;
+			}
+
+			const previous = state.runtimeModel || state.def.model || "session default";
+			if (model) {
+				state.runtimeModel = model;
+			} else {
+				delete state.runtimeModel;
+			}
+			const current = state.runtimeModel || state.def.model || "session default";
+			_ctx.ui.notify(`Model for ${displayName(state.def.name)}: ${previous} → ${current}`, "info");
+		},
+	});
+
 	// ── System Prompt ────────────────────────────
 
 	pi.on("before_agent_start", async (_event, _ctx) => {
 		const expertCatalog = Array.from(experts.values())
-			.map(s => `### ${displayName(s.def.name)}\n**Query as:** \`${s.def.name}\`\n${s.def.description}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}`)
+			.map(s => {
+				const defaultModel = s.def.model || "session default";
+				const runtimeModel = s.runtimeModel ? `\n**Session override:** \`${s.runtimeModel}\`` : "";
+				return `### ${displayName(s.def.name)}\n**Query as:** \`${s.def.name}\`\n${s.def.description}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}\n**Default model:** \`${defaultModel}\`${runtimeModel}`;
+			})
 			.join("\n\n");
 
 		const expertNames = Array.from(experts.values()).map(s => displayName(s.def.name)).join(", ");
@@ -657,8 +802,15 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 				.replace("{{EXPERT_NAMES}}", expertNames)
 				.replace("{{EXPERT_CATALOG}}", expertCatalog);
 
-			// Append instruction about retrieving full expert outputs from disk
-			systemPrompt += `
+			// Append instruction about model selection and retrieving outputs from disk
+			systemPrompt +=`
+## Model Selection
+Each expert has a default model defined in its \`.md\` file (shown above in **Default model**).
+You can override the model for any individual query by adding a \`model\` field to the query object in \`query_experts\` (e.g., \`model: "ollama-cloud/qwen3-coder-next"\`).
+You can also change the session-wide default for an expert using the \`set_expert_model\` tool.
+
+Session overrides and per-query overrides are reset when the extension reloads.
+
 ## Retrieving Full Expert Outputs
 Expert responses may be summarized in tool results. When you need the complete documentation from any expert, use your built-in \`read()\` tool on the file path shown in the result (e.g. \`.pi/outputs/ext-expert.md\`). Do NOT dispatch another agent just to read a file — your native \`read()\` tool reaches the filesystem directly.`;
 		} catch (err) {
@@ -685,7 +837,8 @@ Expert responses may be summarized in tool results. When you need the complete d
 		_ctx.ui.notify(
 			`Pi Pi loaded — ${experts.size} experts: ${expertNames}\n\n` +
 			`/experts          List experts and status\n` +
-			`/experts-grid N   Set grid columns (1-5)\n\n` +
+			`/experts-grid N   Set grid columns (1-5)\n` +
+			`/experts-model <expert> [model]  Set or clear session model override\n\n` +
 			`Ask me to build any Pi agent component!`,
 			"info",
 		);

@@ -30,6 +30,28 @@ Once you have research from all experts:
 
 {{EXPERT_CATALOG}}
 
+## Model Selection Strategy
+You have full control over which model each expert runs on. Use this power wisely:
+
+- Each expert has a **default model** defined in its `.md` file (shown in the catalog above as **Default model**).
+- You can override the model for any **individual query** by adding a `model` field to the query object in `query_experts`.
+- You can set a **session-wide override** for an expert using the `set_expert_model` tool before dispatching work.
+
+### Rules of thumb
+- **Complex reasoning tasks** (architecture design, state machine logic, agent orchestration) → assign stronger models (e.g., `deepseek-v4-pro`, `claude-opus-4-5`).
+- **Lookup/reference tasks** (documentation search, JSON schema validation, syntax examples) → lighter models are sufficient (e.g., `gemini-3-flash`, `qwen3-coder`).
+- **TUI/Theme work** often benefits from visual reasoning → try `gemini-2.5-pro` or `claude-sonnet-4`.
+- **If you don't know what model to use**, leave the default blank and let the expert use its `.md` default or the orchestrator session model.
+
+### How to change models
+```javascript
+// Per-query override (one-off)
+query_experts([{ expert: "ext-expert", question: "...", model: "ollama-cloud/deepseek-v4-pro" }])
+
+// Session-wide override (affects all future calls to this expert until reload)
+set_expert_model({ expert: "ext-expert", model: "ollama-cloud/deepseek-v4-pro" })
+```
+
 ## Rules
 
 1. **ALWAYS query experts FIRST** before writing any Pi-specific code. You need fresh documentation.
@@ -56,3 +78,6 @@ Once you have research from all experts:
 - Prompts: `.pi/prompts/`
 - Agents: `.pi/agents/`
 - Teams: `.pi/agents/teams.yaml`
+
+## Retrieving Full Expert Outputs
+Expert responses may be summarized in tool results. When you need the complete documentation from any expert, use your built-in `read()` tool on the file path shown in the result (e.g., `.pi/outputs/ext-expert.md`). Do NOT dispatch another agent just to read a file — your native `read()` tool reaches the filesystem directly.
