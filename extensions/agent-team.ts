@@ -47,6 +47,7 @@ interface AgentState {
 	contextPct: number;
 	sessionFile: string | null;
 	runCount: number;
+	resolvedModel?: string;  // The model that was actually used ("default" if same as session)
 	timer?: ReturnType<typeof setInterval>;
 }
 
@@ -54,6 +55,12 @@ interface AgentState {
 
 function displayName(name: string): string {
 	return name.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+function stripProvider(modelId?: string): string {
+	if (!modelId) return "default";
+	const parts = modelId.split('/');
+	return parts[parts.length - 1];
 }
 
 // ── Teams YAML Parser ────────────────────────────
@@ -238,9 +245,20 @@ export default function (pi: ExtensionAPI) {
 			: state.status === "done" ? "✓" : "✗";
 
 		const name = displayName(state.def.name);
-		const nameTruncated = truncate(name, w);
-		const nameStr = theme.fg("accent", theme.bold(nameTruncated));
-		const nameVisible = 1 + visibleWidth(nameTruncated);  // Include leading space
+		const modelLabel = state.resolvedModel || "default";
+		const sep = " — ";
+		const combined = name + sep + modelLabel;
+
+		let nameStr: string;
+		let nameVisible: number;
+		if (visibleWidth(combined) <= w) {
+			nameStr = theme.fg("accent", theme.bold(name)) + theme.fg("dim", sep + modelLabel);
+			nameVisible = 1 + visibleWidth(combined);  // Include leading space
+		} else {
+			const nameTruncated = truncate(name, w);
+			nameStr = theme.fg("accent", theme.bold(nameTruncated));
+			nameVisible = 1 + visibleWidth(nameTruncated);  // Include leading space
+		}
 
 		const statusStr = `${statusIcon} ${state.status}`;
 		const timeStr = state.status !== "idle" ? ` ${Math.round(state.elapsed / 1000)}s` : "";
@@ -371,6 +389,10 @@ export default function (pi: ExtensionAPI) {
 
 		// Priority: tool param override > agent definition model > session model > fallback
 		const model = modelOverride || state.def.model || sessionModelFlag;
+
+		// Store model label for card display: "default" if same as session model, else strip provider prefix
+		const isDefault = model === sessionModelFlag;
+		state.resolvedModel = isDefault ? "default" : stripProvider(model);
 
 		// Session file for this agent
 		const agentKey = state.def.name.toLowerCase().replace(/\s+/g, "-");
@@ -565,7 +587,7 @@ export default function (pi: ExtensionAPI) {
 				if (onUpdate) {
 					onUpdate({
 						content: [{ type: "text", text: `Dispatching to ${agent}...` }],
-						details: { agent, task, status: "dispatching" },
+						details: { agent, task, status: "dispatching", modelUsed: state.resolvedModel || "default" },
 					});
 				}
 
@@ -590,6 +612,7 @@ export default function (pi: ExtensionAPI) {
 						agent,
 						task,
 						status,
+						modelUsed: state.resolvedModel || "default",
 						elapsed: result.elapsed,
 						exitCode: result.exitCode,
 						fullOutput: result.output,
@@ -600,12 +623,12 @@ export default function (pi: ExtensionAPI) {
 				if (signal?.aborted) {
 					return {
 						content: [{ type: "text", text: `Agent ${agent} cancelled by user.` }],
-						details: { agent, task, status: "cancelled", elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
+						details: { agent, task, status: "cancelled", modelUsed: state.resolvedModel || "default", elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
 					};
 				}
 				return {
 					content: [{ type: "text", text: `Error dispatching to ${agent}: ${err?.message || err}` }],
-					details: { agent, task, status: "error", elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
+					details: { agent, task, status: "error", modelUsed: state.resolvedModel || "default", elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
 				};
 			}
 		},
@@ -642,8 +665,9 @@ export default function (pi: ExtensionAPI) {
 			const icon = details.status === "done" ? "✓" : details.status === "cancelled" ? "⊘" : "✗";
 			const color = details.status === "done" ? "success" : details.status === "cancelled" ? "warning" : "error";
 			const elapsed = typeof details.elapsed === "number" ? Math.round(details.elapsed / 1000) : 0;
+			const modelTag = details.modelUsed ? ` · ${stripProvider(details.modelUsed)}` : "";
 			const header = theme.fg(color, `${icon} ${details.agent}`) +
-				theme.fg("dim", ` ${elapsed}s`);
+				theme.fg("dim", ` ${elapsed}s${modelTag}`);
 
 			if (options.expanded && details.fullOutput) {
 				const output = details.fullOutput.length > 12000
@@ -763,7 +787,8 @@ export default function (pi: ExtensionAPI) {
 				.map(s => {
 					const session = s.sessionFile ? "resumed" : "new";
 					const exts = s.def.extensions.length ? ` [ext: ${s.def.extensions.join(", ")}]` : "";
-					return `${displayName(s.def.name)} (${s.status}, ${session}, runs: ${s.runCount})${exts}: ${s.def.description}`;
+					const modelLabel = s.def.model ? stripProvider(s.def.model) : "default";
+					return `${displayName(s.def.name)} (${s.status}, ${session}, runs: ${s.runCount}, model: ${modelLabel})${exts}: ${s.def.description}`;
 				})
 				.join("\n");
 			_ctx.ui.notify(names || "No agents loaded", "info");
@@ -798,7 +823,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (_event, _ctx) => {
 		// Build dynamic agent catalog from active team only
 		const agentCatalog = Array.from(agentStates.values())
-			.map(s => `### ${displayName(s.def.name)}\n**Dispatch as:** \`${s.def.name}\`\n${s.def.description}\n**Tools:** ${s.def.tools}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}`)
+			.map(s => {
+				const modelLabel = s.def.model ? stripProvider(s.def.model) : "default";
+				return `### ${displayName(s.def.name)}\n**Dispatch as:** \`${s.def.name}\`\n${s.def.description}\n**Tools:** ${s.def.tools}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}\n**Model:** \`${modelLabel}\``;
+			})
 			.join("\n\n");
 
 		const teamMembers = Array.from(agentStates.values()).map(s => displayName(s.def.name)).join(", ");
