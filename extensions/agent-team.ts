@@ -583,11 +583,17 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { agent, task, model } = params as { agent: string; task: string; model?: string };
 
+			// Resolve model label for display (same priority as dispatchAgent)
+			const fallbackModel = "openrouter/google/gemini-3-flash-preview";
+			const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : fallbackModel;
+			const resolvedModel = model || agentStates.get(agent.toLowerCase())?.def.model || sessionModel;
+			const modelUsed = resolvedModel === sessionModel ? "default" : stripProvider(resolvedModel);
+
 			try {
 				if (onUpdate) {
 					onUpdate({
 						content: [{ type: "text", text: `Dispatching to ${agent}...` }],
-						details: { agent, task, status: "dispatching", modelUsed: state.resolvedModel || "default" },
+						details: { agent, task, status: "dispatching", modelUsed },
 					});
 				}
 
@@ -612,7 +618,7 @@ export default function (pi: ExtensionAPI) {
 						agent,
 						task,
 						status,
-						modelUsed: state.resolvedModel || "default",
+						modelUsed,
 						elapsed: result.elapsed,
 						exitCode: result.exitCode,
 						fullOutput: result.output,
@@ -623,12 +629,12 @@ export default function (pi: ExtensionAPI) {
 				if (signal?.aborted) {
 					return {
 						content: [{ type: "text", text: `Agent ${agent} cancelled by user.` }],
-						details: { agent, task, status: "cancelled", modelUsed: state.resolvedModel || "default", elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
+						details: { agent, task, status: "cancelled", modelUsed, elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
 					};
 				}
 				return {
 					content: [{ type: "text", text: `Error dispatching to ${agent}: ${err?.message || err}` }],
-					details: { agent, task, status: "error", modelUsed: state.resolvedModel || "default", elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
+					details: { agent, task, status: "error", modelUsed, elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
 				};
 			}
 		},
