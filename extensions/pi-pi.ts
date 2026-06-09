@@ -38,7 +38,7 @@ interface ExpertDef {
 
 interface ExpertState {
 	def: ExpertDef;
-	status: "idle" | "researching" | "done" | "error";
+	status: "idle" | "researching" | "done" | "error" | "cancelled";
 	question: string;
 	elapsed: number;
 	lastLine: string;
@@ -166,10 +166,12 @@ export default function (pi: ExtensionAPI) {
 
 		const statusColor = state.status === "idle" ? "dim"
 			: state.status === "researching" ? "accent"
-			: state.status === "done" ? "success" : "error";
+			: state.status === "done" ? "success"
+			: state.status === "cancelled" ? "warning" : "error";
 		const statusIcon = state.status === "idle" ? "○"
 			: state.status === "researching" ? "◉"
-			: state.status === "done" ? "✓" : "✗";
+			: state.status === "done" ? "✓"
+			: state.status === "cancelled" ? "⊘" : "✗";
 
 		const nameText = displayName(state.def.name);
 		const modelName = state.status === "researching"
@@ -298,6 +300,7 @@ export default function (pi: ExtensionAPI) {
 		question: string,
 		ctx: any,
 		modelOverride?: string,
+		signal?: AbortSignal,
 	): Promise<{ output: string; exitCode: number; elapsed: number; model: string }> {
 		const key = expertName.toLowerCase();
 		const state = experts.get(key);
@@ -307,6 +310,16 @@ export default function (pi: ExtensionAPI) {
 				exitCode: 1,
 				elapsed: 0,
 				model: modelOverride || "n/a",
+			});
+		}
+
+		// Bail out immediately if already cancelled
+		if (signal?.aborted) {
+			return Promise.resolve({
+				output: "Cancelled by user",
+				exitCode: -1, // sentinel: -1 means cancelled, not error
+				elapsed: 0,
+				model: modelOverride || state.runtimeModel || state.def.model || "n/a",
 			});
 		}
 
@@ -366,6 +379,17 @@ export default function (pi: ExtensionAPI) {
 				env: { ...process.env },
 			});
 
+			// Kill the child process when the user presses Escape (abort signal fires)
+			const onAbort = () => {
+				clearInterval(state.timer);
+				proc.kill("SIGTERM");
+				state.status = "cancelled";
+				state.lastLine = "Cancelled by user";
+				state.runningModel = undefined;
+				updateWidget();
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+
 			let buffer = "";
 
 			proc.stdout!.setEncoding("utf-8");
@@ -411,6 +435,8 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("close", (code) => {
+				signal?.removeEventListener("abort", onAbort);
+
 				if (buffer.trim()) {
 					try {
 						const event = JSON.parse(buffer);
@@ -423,8 +449,25 @@ export default function (pi: ExtensionAPI) {
 
 				clearInterval(state.timer);
 				state.elapsed = Date.now() - startTime;
-				state.status = code === 0 ? "done" : "error";
 				state.runningModel = undefined;
+
+				// If we were aborted, the onAbort handler already set state to error.
+				// Don't overwrite it with a successful close. Use exitCode: -1 as
+				// a sentinel so the execute handler can mark status="cancelled".
+				if (signal?.aborted) {
+					state.status = "error";
+					state.lastLine = "Cancelled by user";
+					updateWidget();
+					resolve({
+						output: "Cancelled by user",
+						exitCode: -1,
+						elapsed: state.elapsed,
+						model,
+					});
+					return;
+				}
+
+				state.status = code === 0 ? "done" : "error";
 
 				const full = textChunks.join("");
 				state.lastLine = full.split("\n").filter((l: string) => l.trim()).pop() || "";
@@ -457,6 +500,7 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("error", (err) => {
+				signal?.removeEventListener("abort", onAbort);
 				clearInterval(state.timer);
 				state.status = "error";
 				state.runningModel = undefined;
@@ -513,7 +557,7 @@ You may optionally pass a \`model\` field per query to override the expert's def
 			),
 		}),
 
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { queries } = params as { queries: { expert: string; question: string; model?: string }[] };
 
 			if (!queries || queries.length === 0) {
@@ -535,7 +579,7 @@ You may optionally pass a \`model\` field per query to override the expert's def
 			// never discards results from the others
 			const settled = await Promise.allSettled(
 				queries.map(async ({ expert, question, model }) => {
-					const result = await queryExpert(expert, question, ctx, model);
+					const result = await queryExpert(expert, question, ctx, model, signal);
 					const expertKey = expert.toLowerCase().replace(/\s+/g, "-");
 					const outputDir = join(ctx.cwd, ".pi", "outputs");
 					const outputPath = join(outputDir, `${expertKey}.md`);
@@ -546,7 +590,11 @@ You may optionally pass a \`model\` field per query to override the expert's def
 						const cutAt = idx > 0 ? idx : MAX_PREVIEW;
 						preview = result.output.slice(0, cutAt) + "\n\n... [truncated]";
 					}
-					const status = result.exitCode === 0 ? "done" : "error";
+					const status = result.exitCode === 0
+						? "done"
+						: result.exitCode === -1
+						? "cancelled"
+						: "error";
 					// Annotate the model: tag per-query overrides with [override] and
 					// session runtime overrides with [runtime] so the user can tell
 					// which layer resolved the model.
@@ -590,14 +638,14 @@ You may optionally pass a \`model\` field per query to override the expert's def
 			// Top-of-output summary: one line per expert showing the model that
 			// actually got used (so the user can verify set_expert_model overrides).
 			const summaryLines = results.map(r => {
-				const icon = r.status === "done" ? "✓" : "✗";
+				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
 				const m = r.model || "?";
 				return `  ${icon} ${displayName(r.expert)} → ${m} [${r.modelTag || "unknown"}]`;
 			});
 			const summary = `### Active models\n${summaryLines.join("\n")}\n\n---\n\n`;
 
 			const sections = results.map(r => {
-				const icon = r.status === "done" ? "✓" : "✗";
+				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
 				const modelInfo = r.model ? ` — model: ${r.model} [${r.modelTag}]` : "";
 				return `## [${icon}] ${displayName(r.expert)} (${Math.round(r.elapsed / 1000)}s)${modelInfo}\n\n${r.output}`;
 			});
@@ -606,7 +654,9 @@ You may optionally pass a \`model\` field per query to override the expert's def
 				content: [{ type: "text", text: summary + sections.join("\n\n---\n\n") }],
 				details: {
 					results,
-					status: results.every(r => r.status === "done") ? "done" : "partial",
+					status: signal?.aborted
+						? "cancelled"
+						: results.every(r => r.status === "done") ? "done" : "partial",
 				},
 			};
 		},
@@ -642,8 +692,8 @@ You may optionally pass a \`model\` field per query to override the expert's def
 			}
 
 			const lines = (details.results as any[]).map((r: any) => {
-				const icon = r.status === "done" ? "✓" : "✗";
-				const color = r.status === "done" ? "success" : "error";
+				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
+				const color = r.status === "done" ? "success" : r.status === "cancelled" ? "warning" : "error";
 				const elapsed = typeof r.elapsed === "number" ? Math.round(r.elapsed / 1000) : 0;
 				const modelTag = r.model ? ` [${r.model}]` : "";
 				return theme.fg(color, `${icon} ${displayName(r.expert)}`) +
