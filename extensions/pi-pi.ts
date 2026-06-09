@@ -298,7 +298,7 @@ export default function (pi: ExtensionAPI) {
 		question: string,
 		ctx: any,
 		modelOverride?: string,
-	): Promise<{ output: string; exitCode: number; elapsed: number }> {
+	): Promise<{ output: string; exitCode: number; elapsed: number; model: string }> {
 		const key = expertName.toLowerCase();
 		const state = experts.get(key);
 		if (!state) {
@@ -306,6 +306,7 @@ export default function (pi: ExtensionAPI) {
 				output: `Expert "${expertName}" not found. Available: ${Array.from(experts.values()).map(s => s.def.name).join(", ")}`,
 				exitCode: 1,
 				elapsed: 0,
+				model: modelOverride || "n/a",
 			});
 		}
 
@@ -314,6 +315,7 @@ export default function (pi: ExtensionAPI) {
 				output: `Expert "${displayName(state.def.name)}" is already researching. Wait for it to finish.`,
 				exitCode: 1,
 				elapsed: 0,
+				model: modelOverride || state.runtimeModel || state.def.model || "n/a",
 			});
 		}
 
@@ -450,6 +452,7 @@ export default function (pi: ExtensionAPI) {
 					output: full,
 					exitCode: code ?? 1,
 					elapsed: state.elapsed,
+					model,
 				});
 			});
 
@@ -463,6 +466,7 @@ export default function (pi: ExtensionAPI) {
 					output: `Error spawning expert: ${err.message}`,
 					exitCode: 1,
 					elapsed: Date.now() - startTime,
+					model,
 				});
 			});
 		});
@@ -543,6 +547,14 @@ You may optionally pass a \`model\` field per query to override the expert's def
 						preview = result.output.slice(0, cutAt) + "\n\n... [truncated]";
 					}
 					const status = result.exitCode === 0 ? "done" : "error";
+					// Annotate the model: tag per-query overrides with [override] and
+					// session runtime overrides with [runtime] so the user can tell
+					// which layer resolved the model.
+					const modelTag = model
+						? "override"
+						: result.model && experts.get(expert.toLowerCase())?.runtimeModel
+						? "runtime"
+						: "default";
 					return {
 						expert,
 						question,
@@ -552,7 +564,8 @@ You may optionally pass a \`model\` field per query to override the expert's def
 						output: `${preview}\n\n[Full output: ${outputPath}]`,
 						fullOutput: result.output,
 						outputPath,
-						model, // record which model was used for this query
+						model: result.model, // actual model resolved by the priority chain
+						modelTag,
 					};
 				}),
 			);
@@ -569,17 +582,28 @@ You may optionally pass a \`model\` field per query to override the expert's def
 						output: `Error: ${(s.reason as any)?.message || s.reason}`,
 						fullOutput: "",
 						model: queries[i].model,
+						modelTag: queries[i].model ? "override" : "unknown",
 					},
 			);
 
 			// Build combined response
+			// Top-of-output summary: one line per expert showing the model that
+			// actually got used (so the user can verify set_expert_model overrides).
+			const summaryLines = results.map(r => {
+				const icon = r.status === "done" ? "✓" : "✗";
+				const m = r.model || "?";
+				return `  ${icon} ${displayName(r.expert)} → ${m} [${r.modelTag || "unknown"}]`;
+			});
+			const summary = `### Active models\n${summaryLines.join("\n")}\n\n---\n\n`;
+
 			const sections = results.map(r => {
 				const icon = r.status === "done" ? "✓" : "✗";
-				return `## [${icon}] ${displayName(r.expert)} (${Math.round(r.elapsed / 1000)}s)${r.model ? ` — model: ${r.model}` : ""}\n\n${r.output}`;
+				const modelInfo = r.model ? ` — model: ${r.model} [${r.modelTag}]` : "";
+				return `## [${icon}] ${displayName(r.expert)} (${Math.round(r.elapsed / 1000)}s)${modelInfo}\n\n${r.output}`;
 			});
 
 			return {
-				content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
+				content: [{ type: "text", text: summary + sections.join("\n\n---\n\n") }],
 				details: {
 					results,
 					status: results.every(r => r.status === "done") ? "done" : "partial",
