@@ -634,9 +634,7 @@ export default function (pi: ExtensionAPI) {
 				const MAX_PREVIEW = 2500;
 				let preview = result.output;
 				if (result.output.length > MAX_PREVIEW) {
-					const idx = result.output.lastIndexOf("\n", MAX_PREVIEW);
-					const cutAt = idx > 0 ? idx : MAX_PREVIEW;
-					preview = result.output.slice(0, cutAt) + "\n\n... [truncated]";
+					preview = truncatePreview(result.output, MAX_PREVIEW);
 				}
 
 				const status = result.exitCode === 0 ? "done" : "error";
@@ -706,9 +704,7 @@ export default function (pi: ExtensionAPI) {
 				theme.fg("dim", ` ${elapsed}s${modelTag}`);
 
 			if (options.expanded && details.fullOutput) {
-				const output = details.fullOutput.length > 12000
-					? details.fullOutput.slice(0, 12000) + "\n... [truncated]"
-					: details.fullOutput;
+				const output = truncateRender(details.fullOutput, 12000);
 				return new Text(header + "\n" + theme.fg("muted", output), 0, 0);
 			}
 
@@ -809,9 +805,7 @@ export default function (pi: ExtensionAPI) {
 					const MAX_PREVIEW = 2500;
 					let preview = result.output;
 					if (result.output.length > MAX_PREVIEW) {
-						const cutIdx = result.output.lastIndexOf("\n", MAX_PREVIEW);
-						const cutAt = cutIdx > 0 ? cutIdx : MAX_PREVIEW;
-						preview = result.output.slice(0, cutAt) + "\n\n... [truncated]";
+						preview = truncatePreview(result.output, MAX_PREVIEW);
 					}
 
 					const status = result.exitCode === 0 ? "done" : "error";
@@ -925,7 +919,7 @@ export default function (pi: ExtensionAPI) {
 			if (options.expanded && details.results) {
 				const expanded = (details.results as any[]).map((r: any) => {
 					const output = r.fullOutput
-						? (r.fullOutput.length > 12000 ? r.fullOutput.slice(0, 12000) + "\n... [truncated]" : r.fullOutput)
+						? truncateRender(r.fullOutput, 12000)
 						: r.output || "";
 					const modelTag = r.modelUsed ? ` — model: ${r.modelUsed}` : "";
 					return theme.fg("accent", `── ${displayName(r.agent)}${modelTag} ──`) + "\n" + theme.fg("muted", output);
@@ -939,16 +933,52 @@ export default function (pi: ExtensionAPI) {
 
 	// ── read_agent_output Tool ──
 
+	const OUTPUT_MAX_BYTES = 50 * 1024; // 50 KB — matches Pi's internal tool cap
+
+	function sliceOutput(text: string, offset?: number, limit?: number): string {
+		if (offset === undefined && limit === undefined) return text;
+		const lines = text.split("\n");
+		const start = offset !== undefined ? Math.max(1, offset) - 1 : 0;  // 1-based → 0-based
+		const end = limit !== undefined ? Math.min(start + limit, lines.length) : lines.length;
+		const sliced = lines.slice(start, end);
+		const totalLines = lines.length;
+		const fromLine = start + 1;
+		const toLine = Math.min(start + (limit || totalLines), totalLines);
+		return `Lines ${fromLine}-${toLine} of ${totalLines}:\n${sliced.join("\n")}`;
+	}
+
+	function truncateOutput(text: string): string {
+		if (Buffer.byteLength(text, "utf-8") <= OUTPUT_MAX_BYTES) return text;
+		const half = Math.floor(OUTPUT_MAX_BYTES / 2);
+		const bytes = new TextEncoder().encode(text);
+		const head = new TextDecoder().decode(bytes.slice(0, half));
+		const tail = new TextDecoder().decode(bytes.slice(-half));
+		return `${head}\n\n... [middle truncated — use read_agent_output with offset/limit to read specific lines] ...\n\n${tail}`;
+	}
+
+	function truncatePreview(text: string, maxLen: number): string {
+		if (text.length <= maxLen) return text;
+		const idx = text.lastIndexOf("\n", maxLen);
+		const cutAt = idx > 0 ? idx : maxLen;
+		return text.slice(0, cutAt) + "\n\n... [truncated — use read_agent_output with offset/limit to read specific lines]";
+	}
+
+	function truncateRender(text: string, maxLen: number): string {
+		return text.length > maxLen ? text.slice(0, maxLen) + "\n... [truncated]" : text;
+	}
+
 	pi.registerTool({
 		name: "read_agent_output",
 		label: "Read Agent Output",
-		description: "Read the full saved output file of a completed specialist agent directly from disk. Use this to inspect long outputs without dispatching another agent.",
+		description: "Read the saved output of a completed specialist agent. If the agent's output was truncated in the dispatch result, call this tool to get the full text. Supports offset/limit to read specific line ranges from large outputs.",
 		parameters: Type.Object({
 			agent: Type.String({ description: "Agent name (case-insensitive)" }),
+			offset: Type.Optional(Type.Number({ minimum: 1, description: "1-based line number to start reading from. Defaults to 1 (beginning)." })),
+			limit: Type.Optional(Type.Number({ minimum: 1, description: "Maximum number of lines to read. Defaults to all lines from offset to end." })),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const { agent } = params as { agent: string };
+			const { agent, offset, limit } = params as { agent: string; offset?: number; limit?: number };
 			const agentKey = agent.toLowerCase().replace(/\s+/g, "-");
 			const outputPath = join(outputBaseDir, `${agentKey}.md`);
 
@@ -959,29 +989,39 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const MAX_BYTES = 50 * 1024; // 50 KB — matches Pi's internal tool cap
 			let full = readFileSync(outputPath, "utf-8");
-			const truncated = Buffer.byteLength(full, "utf-8") > MAX_BYTES;
-			if (truncated) {
-				const half = Math.floor(MAX_BYTES / 2);
-				const enc = new TextEncoder();
-				const bytes = enc.encode(full);
-				const head = new TextDecoder().decode(bytes.slice(0, half));
-				const tail = new TextDecoder().decode(bytes.slice(-half));
-				full = `${head}\n\n... [output truncated by extension; middle omitted] ...\n\n${tail}`;
+			const totalLines = full.split("\n").length;
+			const hasRange = offset !== undefined || limit !== undefined;
+
+			let result: string;
+			let truncated: boolean;
+			if (hasRange) {
+				// Selective line range — slice first, then truncate if still over limit
+				const sliced = sliceOutput(full, offset, limit);
+				truncated = Buffer.byteLength(sliced, "utf-8") > OUTPUT_MAX_BYTES;
+				result = truncated ? truncateOutput(sliced) : sliced;
+			} else {
+				// Full read — truncate if over limit
+				truncated = Buffer.byteLength(full, "utf-8") > OUTPUT_MAX_BYTES;
+				result = truncated ? truncateOutput(full) : full;
 			}
 
 			return {
-				content: [{ type: "text", text: full }],
-				details: { agent, outputPath, found: true, truncated },
+				content: [{ type: "text", text: result }],
+				details: { agent, outputPath, found: true, truncated, totalLines, offset, limit },
 			};
 		},
 
 		renderCall(args, theme) {
-			const agentName = (args as any).agent || "?";
+			const a = args as any;
+			const agentName = a.agent || "?";
+			const off = a.offset;
+			const lim = a.limit;
+			const range = off || lim ? ` L${off || 1}${lim ? `-L${(off || 1) + lim - 1}` : ""}` : "";
 			return new Text(
 				theme.fg("toolTitle", theme.bold("read_agent_output ")) +
-				theme.fg("accent", agentName),
+				theme.fg("accent", agentName) +
+				(range ? theme.fg("dim", range) : ""),
 				0, 0,
 			);
 		},
@@ -995,15 +1035,14 @@ export default function (pi: ExtensionAPI) {
 			if (!details.found) {
 				return new Text(theme.fg("error", `✗ ${details.agent || "?"} — not found`), 0, 0);
 			}
+			const rangeInfo = details.offset || details.limit
+				? ` L${details.offset || 1}${details.limit ? `-L${(details.offset || 1) + details.limit - 1}` : ""}${details.totalLines ? `/${details.totalLines}` : ""}`
+				: details.totalLines ? ` (${details.totalLines} lines)` : "";
 			if (options.expanded && text?.type === "text") {
-				const output = details.truncated
-					? text.text
-					: text.text.length > 12000
-					? text.text.slice(0, 12000) + "\n... [truncated]"
-					: text.text;
-				return new Text(theme.fg("success", `✓ ${details.agent}`) + "\n" + theme.fg("muted", output), 0, 0);
+				const output = truncateRender(text.text, 12000);
+				return new Text(theme.fg("success", `✓ ${details.agent}${rangeInfo}`) + "\n" + theme.fg("muted", output), 0, 0);
 			}
-			return new Text(theme.fg("success", `✓ ${details.agent}`) + theme.fg("dim", " output loaded"), 0, 0);
+			return new Text(theme.fg("success", `✓ ${details.agent}`) + theme.fg("dim", `${rangeInfo} output loaded`), 0, 0);
 		},
 	});
 
@@ -1106,12 +1145,12 @@ You can ONLY dispatch to agents listed below. Do not attempt to dispatch to agen
 - If a task fails, try a different agent or adjust the task description
 - Summarize the outcome for the user
 
-## Retrieving Agent Outputs
-Specialist agents may return long outputs. When you need the full text of a previously dispatched agent, use the read_agent_output tool directly (do NOT dispatch another agent just to read a file). The tool returns the complete saved output up to the system limit; if it is truncated you will see a middle-ellipsis note.
-
 ## Rules
 - NEVER try to read, write, or execute code directly — you have no such tools
 - ALWAYS use dispatch_agent to get work done
+- ALWAYS use read_agent_output to retrieve a previously dispatched agent's full output — do NOT dispatch another agent just to re-read a file
+- When you see "... [truncated]" in an agent's output, immediately call read_agent_output with that agent's name to get the full text
+- For large outputs, use read_agent_output with offset and limit to read specific line ranges (e.g. {agent: "scout", offset: 50, limit: 100})
 - You can chain agents: use scout to explore, then builder to implement
 - You can dispatch the same agent multiple times with different tasks
 - Keep tasks focused — one clear objective per dispatch
