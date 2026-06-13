@@ -40,7 +40,7 @@ interface AgentDef {
 
 interface AgentState {
 	def: AgentDef;
-	status: "idle" | "running" | "done" | "error" | "timeout";
+	status: "idle" | "running" | "done" | "error" | "timeout" | "cancelled";
 	task: string;
 	toolCount: number;
 	elapsed: number;
@@ -51,6 +51,7 @@ interface AgentState {
 	resolvedModel?: string;  // The model that was actually used ("default" if same as session)
 	timer?: ReturnType<typeof setInterval>;
 	childPid?: number;      // Active child process PID — used to kill lingering processes on re-spawn
+	outputPath?: string;    // Path to the most recent saved output file for this agent
 }
 
 // ── Display Name Helper ──────────────────────────
@@ -243,11 +244,13 @@ export default function (pi: ExtensionAPI) {
 		const statusColor = state.status === "idle" ? "dim"
 			: state.status === "running" ? "accent"
 			: state.status === "done" ? "success"
-			: state.status === "timeout" ? "warning" : "error";
+			: state.status === "timeout" ? "warning"
+			: state.status === "cancelled" ? "warning" : "error";
 		const statusIcon = state.status === "idle" ? "○"
 			: state.status === "running" ? "●"
 			: state.status === "done" ? "✓"
-			: state.status === "timeout" ? "⏱" : "✗";
+			: state.status === "timeout" ? "⏱"
+			: state.status === "cancelled" ? "⊘" : "✗";
 
 		const name = displayName(state.def.name);
 		const modelLabel = state.resolvedModel || "default";
@@ -473,7 +476,7 @@ export default function (pi: ExtensionAPI) {
 				setTimeout(() => {
 					if (!proc.killed) proc.kill("SIGKILL");
 				}, 5000);
-				state.status = "error";
+				state.status = "cancelled";
 				state.lastWork = "Cancelled by user";
 				state.childPid = undefined;
 				updateWidget();
@@ -571,7 +574,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (wasAborted) {
-					state.status = "error";
+					state.status = "cancelled";
 					state.lastWork = "Cancelled by user";
 					updateWidget();
 					reject(new Error("aborted"));
@@ -591,17 +594,18 @@ export default function (pi: ExtensionAPI) {
 				// Persist full output to disk for the orchestrator to inspect
 				try {
 					if (!existsSync(outputBaseDir)) mkdirSync(outputBaseDir, { recursive: true });
-					const outputPath = join(outputBaseDir, `${agentKey}.md`);
+					const uniquePath = join(outputBaseDir, `${agentKey}_${Date.now()}.md`);
 					let outputBody = full;
 					if (stderrChunks.length > 0) {
 						outputBody += "\n\n--- stderr ---\n" + stderrChunks.join("");
 					}
-					writeFileSync(outputPath, outputBody, "utf-8");
+					writeFileSync(uniquePath, outputBody, "utf-8");
+					state.outputPath = uniquePath;
 				} catch {}
 
 				ctx.ui.notify(
 					`${displayName(state.def.name)} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
-					state.status === "done" ? "success" : state.status === "timeout" ? "warning" : "error"
+					state.status === "done" ? "success" : state.status === "timeout" || state.status === "cancelled" ? "warning" : "error"
 				);
 
 				resolve({
@@ -685,7 +689,8 @@ export default function (pi: ExtensionAPI) {
 				const result = await dispatchAgent(agent, task, ctx, model, signal, timeout);
 
 				const agentKey = agent.toLowerCase().replace(/\s+/g, "-");
-				const outputPath = join(outputBaseDir, `${agentKey}.md`);
+				const state = agentStates.get(agentKey);
+				const outputPath = state?.outputPath || join(outputBaseDir, `${agentKey}.md`);
 				const MAX_PREVIEW = 2500;
 				let preview = result.output;
 				if (result.output.length > MAX_PREVIEW) {
@@ -861,7 +866,8 @@ export default function (pi: ExtensionAPI) {
 					const result = await dispatchAgent(config.agent, config.task, ctx, config.model, signal, config.timeout);
 
 					const agentKey = config.agent.toLowerCase().replace(/\s+/g, "-");
-					const outputPath = join(outputBaseDir, `${agentKey}.md`);
+					const state = agentStates.get(agentKey);
+					const outputPath = state?.outputPath || join(outputBaseDir, `${agentKey}.md`);
 
 					const MAX_PREVIEW = 2500;
 					let preview = result.output;
@@ -1047,7 +1053,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const { agent, offset, limit } = params as { agent: string; offset?: number; limit?: number };
 			const agentKey = agent.toLowerCase().replace(/\s+/g, "-");
-			const outputPath = join(outputBaseDir, `${agentKey}.md`);
+			const state = agentStates.get(agentKey);
+			const outputPath = state?.outputPath || join(outputBaseDir, `${agentKey}.md`);
 
 			if (!existsSync(outputPath)) {
 				return {
