@@ -34,12 +34,13 @@ interface AgentDef {
 	extensions: string[];
 	systemPrompt: string;
 	model?: string;      // Optional per-agent model override (e.g. "google/gemini-2.5-pro")
+	timeout?: number;    // Optional per-agent timeout in seconds (default: 60)
 	file: string;
 }
 
 interface AgentState {
 	def: AgentDef;
-	status: "idle" | "running" | "done" | "error";
+	status: "idle" | "running" | "done" | "error" | "timeout";
 	task: string;
 	toolCount: number;
 	elapsed: number;
@@ -109,6 +110,7 @@ function parseAgentFile(filePath: string): AgentDef | null {
 				? frontmatter.extensions.split(",").map((e) =>	e.trim()).filter(Boolean)
 				: [],
 			model: frontmatter.model || undefined,
+			timeout: frontmatter.timeout ? parseInt(frontmatter.timeout, 10) : undefined,
 			systemPrompt: match[2].trim(),
 			file: filePath,
 		};
@@ -239,10 +241,12 @@ export default function (pi: ExtensionAPI) {
 
 		const statusColor = state.status === "idle" ? "dim"
 			: state.status === "running" ? "accent"
-			: state.status === "done" ? "success" : "error";
+			: state.status === "done" ? "success"
+			: state.status === "timeout" ? "warning" : "error";
 		const statusIcon = state.status === "idle" ? "○"
 			: state.status === "running" ? "●"
-			: state.status === "done" ? "✓" : "✗";
+			: state.status === "done" ? "✓"
+			: state.status === "timeout" ? "⏱" : "✗";
 
 		const name = displayName(state.def.name);
 		const modelLabel = state.resolvedModel || "default";
@@ -347,7 +351,8 @@ export default function (pi: ExtensionAPI) {
 		ctx: any,
 		modelOverride?: string,
 		signal?: AbortSignal,
-	): Promise<{ output: string; exitCode: number; elapsed: number }> {
+		timeoutOverride?: number,
+	): Promise<{ output: string; exitCode: number; elapsed: number; timedOut?: boolean }> {
 		// Bail out immediately if already cancelled
 		if (signal?.aborted) {
 			return Promise.resolve({ output: "Cancelled", exitCode: 1, elapsed: 0 });
@@ -377,6 +382,9 @@ export default function (pi: ExtensionAPI) {
 		state.lastWork = "";
 		state.runCount++;
 		updateWidget();
+
+		const DEFAULT_AGENT_TIMEOUT_S = 60;
+		const agentTimeoutMs = (timeoutOverride || state.def.timeout || DEFAULT_AGENT_TIMEOUT_S) * 1000;
 
 		const startTime = Date.now();
 		state.timer = setInterval(() => {
@@ -429,8 +437,22 @@ export default function (pi: ExtensionAPI) {
 
 			// Kill the child process when the user presses Escape (abort signal fires)
 			let wasAborted = false;
+			let wasTimedOut = false;
+			const timeoutTimer = setTimeout(() => {
+				wasTimedOut = true;
+				clearInterval(state.timer);
+				proc.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 5000);
+				state.status = "timeout";
+				state.lastWork = `Timed out after ${Math.round(agentTimeoutMs / 1000)}s`;
+				updateWidget();
+			}, agentTimeoutMs);
+
 			const killProc = () => {
 				wasAborted = true;
+				clearTimeout(timeoutTimer);
 				clearInterval(state.timer);
 				proc.kill("SIGTERM");
 				setTimeout(() => {
@@ -503,6 +525,7 @@ export default function (pi: ExtensionAPI) {
 
 			proc.on("close", (code) => {
 				signal?.removeEventListener("abort", killProc);
+				clearTimeout(timeoutTimer);
 
 				if (buffer.trim()) {
 					try {
@@ -516,6 +539,19 @@ export default function (pi: ExtensionAPI) {
 
 				clearInterval(state.timer);
 				state.elapsed = Date.now() - startTime;
+				const full = textChunks.join("");
+
+				if (wasTimedOut) {
+					state.status = "timeout";
+					updateWidget();
+					resolve({
+						output: full,
+						exitCode: 1,
+						elapsed: state.elapsed,
+						timedOut: true,
+					});
+					return;
+				}
 
 				if (wasAborted) {
 					state.status = "error";
@@ -532,7 +568,6 @@ export default function (pi: ExtensionAPI) {
 					state.sessionFile = agentSessionFile;
 				}
 
-				const full = textChunks.join("");
 				state.lastWork = full.split("\n").filter((l: string) => l.trim()).pop() || "";
 				updateWidget();
 
@@ -549,7 +584,7 @@ export default function (pi: ExtensionAPI) {
 
 				ctx.ui.notify(
 					`${displayName(state.def.name)} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
-					state.status === "done" ? "success" : "error"
+					state.status === "done" ? "success" : state.status === "timeout" ? "warning" : "error"
 				);
 
 				resolve({
@@ -561,6 +596,7 @@ export default function (pi: ExtensionAPI) {
 
 			proc.on("error", (err) => {
 				signal?.removeEventListener("abort", killProc);
+				clearTimeout(timeoutTimer);
 				clearInterval(state.timer);
 				state.status = "error";
 				state.lastWork = `Error: ${err.message}`;
@@ -608,10 +644,11 @@ export default function (pi: ExtensionAPI) {
 			agent: Type.String({ description: "Agent name (case-insensitive)" }),
 			task: Type.String({ description: "Task description for the agent to execute" }),
 			model: Type.Optional(Type.String({ description: "Override the model for this dispatch. Format: provider/id (e.g. google/gemini-2.5-pro). Uses agent default or session model if omitted." })),
+			timeout: Type.Optional(Type.Number({ minimum: 1, description: "Override the timeout for this dispatch in seconds. Uses agent default (from .md frontmatter) or 60s if omitted." })),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const { agent, task, model } = params as { agent: string; task: string; model?: string };
+			const { agent, task, model, timeout } = params as { agent: string; task: string; model?: string; timeout?: number };
 
 			// Resolve model label for display (same priority as dispatchAgent)
 			const fallbackModel = "openrouter/google/gemini-3-flash-preview";
@@ -627,7 +664,7 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				const result = await dispatchAgent(agent, task, ctx, model, signal);
+				const result = await dispatchAgent(agent, task, ctx, model, signal, timeout);
 
 				const agentKey = agent.toLowerCase().replace(/\s+/g, "-");
 				const outputPath = join(outputBaseDir, `${agentKey}.md`);
@@ -637,7 +674,7 @@ export default function (pi: ExtensionAPI) {
 					preview = truncatePreview(result.output, MAX_PREVIEW);
 				}
 
-				const status = result.exitCode === 0 ? "done" : "error";
+				const status = result.timedOut ? "timeout" : result.exitCode === 0 ? "done" : "error";
 				const summary = `[${agent}] ${status} in ${Math.round(result.elapsed / 1000)}s`;
 
 				return {
@@ -651,13 +688,14 @@ export default function (pi: ExtensionAPI) {
 						exitCode: result.exitCode,
 						fullOutput: result.output,
 						outputPath,
+						timedOut: result.timedOut || false,
 					},
 				};
 			} catch (err: any) {
 				if (signal?.aborted) {
 					return {
 						content: [{ type: "text", text: `Agent ${agent} cancelled by user.` }],
-						details: { agent, task, status: "cancelled", modelUsed, elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "" },
+						details: { agent, task, status: "cancelled", modelUsed, elapsed: 0, exitCode: 1, fullOutput: "", outputPath: "", timedOut: false },
 					};
 				}
 				return {
@@ -696,8 +734,12 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const icon = details.status === "done" ? "✓" : details.status === "cancelled" ? "⊘" : "✗";
-			const color = details.status === "done" ? "success" : details.status === "cancelled" ? "warning" : "error";
+			const icon = details.status === "done" ? "✓"
+				: details.status === "cancelled" ? "⊘"
+				: details.status === "timeout" ? "⏱" : "✗";
+			const color = details.status === "done" ? "success"
+				: details.status === "cancelled" ? "warning"
+				: details.status === "timeout" ? "warning" : "error";
 			const elapsed = typeof details.elapsed === "number" ? Math.round(details.elapsed / 1000) : 0;
 			const modelTag = details.modelUsed ? ` · ${stripProvider(details.modelUsed)}` : "";
 			const header = theme.fg(color, `${icon} ${details.agent}`) +
@@ -725,6 +767,7 @@ export default function (pi: ExtensionAPI) {
 					agent: Type.String({ description: "Agent name (case-insensitive)" }),
 					task: Type.String({ description: "Task description for the agent to execute" }),
 					model: Type.Optional(Type.String({ description: "Override the model for this dispatch. Format: provider/id (e.g. google/gemini-2.5-pro). Uses agent default or session model if omitted." })),
+					timeout: Type.Optional(Type.Number({ minimum: 1, description: "Override the timeout for this agent in seconds. Uses agent default or 60s if omitted." })),
 				}),
 				{ description: "Array of agent tasks. Executed in order with controlled concurrency. Minimum 1 item.", minItems: 1 },
 			),
@@ -737,7 +780,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { agents, concurrency } = params as {
-				agents: { agent: string; task: string; model?: string }[];
+				agents: { agent: string; task: string; model?: string; timeout?: number }[];
 				concurrency?: number;
 			};
 
@@ -753,7 +796,7 @@ export default function (pi: ExtensionAPI) {
 			const allResults: Array<{
 				agent: string;
 				task: string;
-				status: "done" | "error" | "cancelled";
+				status: "done" | "error" | "cancelled" | "timeout";
 				elapsed: number;
 				exitCode: number;
 				output: string;
@@ -797,7 +840,7 @@ export default function (pi: ExtensionAPI) {
 				const modelUsed = resolvedModel === sessionModel ? "default" : stripProvider(resolvedModel);
 
 				try {
-					const result = await dispatchAgent(config.agent, config.task, ctx, config.model, signal);
+					const result = await dispatchAgent(config.agent, config.task, ctx, config.model, signal, config.timeout);
 
 					const agentKey = config.agent.toLowerCase().replace(/\s+/g, "-");
 					const outputPath = join(outputBaseDir, `${agentKey}.md`);
@@ -808,7 +851,7 @@ export default function (pi: ExtensionAPI) {
 						preview = truncatePreview(result.output, MAX_PREVIEW);
 					}
 
-					const status = result.exitCode === 0 ? "done" : "error";
+					const status = result.timedOut ? "timeout" : result.exitCode === 0 ? "done" : "error";
 					const resultObj = {
 						agent: config.agent,
 						task: config.task,
@@ -852,7 +895,9 @@ export default function (pi: ExtensionAPI) {
 
 			// Build combined response
 			const summaryLines = runResults.map(r => {
-				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
+				const icon = r.status === "done" ? "✓"
+					: r.status === "cancelled" ? "⊘"
+					: r.status === "timeout" ? "⏱" : "✗";
 				return `  ${icon} ${displayName(r.agent)} (${Math.round(r.elapsed / 1000)}s) [${r.modelUsed}]`;
 			});
 			const summary = `### Dispatch Results\n${summaryLines.join("\n")}\n\n---\n\n`;
@@ -906,8 +951,12 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const lines = (details.results as any[]).map((r: any) => {
-				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
-				const color = r.status === "done" ? "success" : r.status === "cancelled" ? "warning" : "error";
+				const icon = r.status === "done" ? "✓"
+					: r.status === "cancelled" ? "⊘"
+					: r.status === "timeout" ? "⏱" : "✗";
+				const color = r.status === "done" ? "success"
+					: r.status === "cancelled" ? "warning"
+					: r.status === "timeout" ? "warning" : "error";
 				const elapsed = typeof r.elapsed === "number" ? Math.round(r.elapsed / 1000) : 0;
 				const modelTag = r.modelUsed ? ` [${r.modelUsed}]` : "";
 				return theme.fg(color, `${icon} ${displayName(r.agent)}`) +
@@ -1121,7 +1170,8 @@ export default function (pi: ExtensionAPI) {
 		const agentCatalog = Array.from(agentStates.values())
 			.map(s => {
 				const modelLabel = s.def.model ? stripProvider(s.def.model) : "default";
-				return `### ${displayName(s.def.name)}\n**Dispatch as:** \`${s.def.name}\`\n${s.def.description}\n**Tools:** ${s.def.tools}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}\n**Model:** \`${modelLabel}\``;
+				const timeoutLabel = s.def.timeout ? `${s.def.timeout}s` : "default (60s)";
+				return `### ${displayName(s.def.name)}\n**Dispatch as:** \`${s.def.name}\`\n${s.def.description}\n**Tools:** ${s.def.tools}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}\n**Model:** \`${modelLabel}\`\n**Timeout:** \`${timeoutLabel}\``;
 			})
 			.join("\n\n");
 
@@ -1151,6 +1201,8 @@ You can ONLY dispatch to agents listed below. Do not attempt to dispatch to agen
 - ALWAYS use read_agent_output to retrieve a previously dispatched agent's full output — do NOT dispatch another agent just to re-read a file
 - When you see "... [truncated]" in an agent's output, immediately call read_agent_output with that agent's name to get the full text
 - For large outputs, use read_agent_output with offset and limit to read specific line ranges (e.g. {agent: "scout", offset: 50, limit: 100})
+- Each agent has a default timeout (shown in catalog). Use the \`timeout\` parameter to override per-dispatch. Minimum 1 second.
+- If an agent times out (⏱), it was killed after exceeding its timeout — break the task into smaller pieces and retry
 - You can chain agents: use scout to explore, then builder to implement
 - You can dispatch the same agent multiple times with different tasks
 - Keep tasks focused — one clear objective per dispatch
