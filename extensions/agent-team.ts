@@ -50,6 +50,7 @@ interface AgentState {
 	runCount: number;
 	resolvedModel?: string;  // The model that was actually used ("default" if same as session)
 	timer?: ReturnType<typeof setInterval>;
+	childPid?: number;      // Active child process PID — used to kill lingering processes on re-spawn
 }
 
 // ── Display Name Helper ──────────────────────────
@@ -375,6 +376,17 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
+		// Guard: if a previous spawn left a lingering child (e.g. timed-out process
+		// still in SIGTERM grace period), SIGKILL it before allowing a new spawn.
+		if (state.childPid) {
+			try {
+				process.kill(state.childPid, "SIGKILL");
+			} catch {
+				// Process already exited — safe to ignore
+			}
+			state.childPid = undefined;
+		}
+
 		state.status = "running";
 		state.task = task;
 		state.toolCount = 0;
@@ -435,6 +447,8 @@ export default function (pi: ExtensionAPI) {
 				env: { ...process.env },
 			});
 
+			state.childPid = proc.pid;
+
 			// Kill the child process when the user presses Escape (abort signal fires)
 			let wasAborted = false;
 			let wasTimedOut = false;
@@ -447,6 +461,7 @@ export default function (pi: ExtensionAPI) {
 				}, 5000);
 				state.status = "timeout";
 				state.lastWork = `Timed out after ${Math.round(agentTimeoutMs / 1000)}s`;
+				state.childPid = undefined;
 				updateWidget();
 			}, agentTimeoutMs);
 
@@ -460,6 +475,7 @@ export default function (pi: ExtensionAPI) {
 				}, 5000);
 				state.status = "error";
 				state.lastWork = "Cancelled by user";
+				state.childPid = undefined;
 				updateWidget();
 			};
 			if (signal?.aborted) killProc();
@@ -526,6 +542,7 @@ export default function (pi: ExtensionAPI) {
 			proc.on("close", (code) => {
 				signal?.removeEventListener("abort", killProc);
 				clearTimeout(timeoutTimer);
+				state.childPid = undefined;
 
 				if (buffer.trim()) {
 					try {
@@ -598,6 +615,7 @@ export default function (pi: ExtensionAPI) {
 				signal?.removeEventListener("abort", killProc);
 				clearTimeout(timeoutTimer);
 				clearInterval(state.timer);
+				state.childPid = undefined;
 				state.status = "error";
 				state.lastWork = `Error: ${err.message}`;
 				updateWidget();
