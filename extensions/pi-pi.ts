@@ -33,12 +33,13 @@ interface ExpertDef {
 	extensions: string[];
 	systemPrompt: string;
 	model?: string;      // Optional per-expert model defined in .md frontmatter
+	timeout?: number;    // Optional per-expert timeout in seconds (default: 60)
 	file: string;
 }
 
 interface ExpertState {
 	def: ExpertDef;
-	status: "idle" | "researching" | "done" | "error" | "cancelled";
+	status: "idle" | "researching" | "done" | "error" | "cancelled" | "timeout";
 	question: string;
 	elapsed: number;
 	lastLine: string;
@@ -84,6 +85,7 @@ function parseAgentFile(filePath: string): ExpertDef | null {
 				? frontmatter.extensions.split(",").map((e) => e.trim()).filter(Boolean)
 				: [],
 			model: frontmatter.model || undefined,
+			timeout: frontmatter.timeout ? parseInt(frontmatter.timeout, 10) : undefined,
 			systemPrompt: match[2].trim(),
 			file: filePath,
 		};
@@ -167,11 +169,13 @@ export default function (pi: ExtensionAPI) {
 		const statusColor = state.status === "idle" ? "dim"
 			: state.status === "researching" ? "accent"
 			: state.status === "done" ? "success"
-			: state.status === "cancelled" ? "warning" : "error";
+			: state.status === "cancelled" ? "warning"
+			: state.status === "timeout" ? "warning" : "error";
 		const statusIcon = state.status === "idle" ? "○"
 			: state.status === "researching" ? "◉"
 			: state.status === "done" ? "✓"
-			: state.status === "cancelled" ? "⊘" : "✗";
+			: state.status === "cancelled" ? "⊘"
+			: state.status === "timeout" ? "⏱" : "✗";
 
 		const nameText = displayName(state.def.name);
 		const modelName = state.status === "researching"
@@ -301,7 +305,8 @@ export default function (pi: ExtensionAPI) {
 		ctx: any,
 		modelOverride?: string,
 		signal?: AbortSignal,
-	): Promise<{ output: string; exitCode: number; elapsed: number; model: string }> {
+		timeoutOverride?: number,
+	): Promise<{ output: string; exitCode: number; elapsed: number; model: string; timedOut?: boolean }> {
 		const key = expertName.toLowerCase();
 		const state = experts.get(key);
 		if (!state) {
@@ -345,6 +350,9 @@ export default function (pi: ExtensionAPI) {
 			updateWidget();
 		}, 1000);
 
+		const DEFAULT_EXPERT_TIMEOUT_S = 60;
+		const agentTimeoutMs = (timeoutOverride || state.def.timeout || DEFAULT_EXPERT_TIMEOUT_S) * 1000;
+
 		const fallbackModel = "openrouter/google/gemini-3-flash-preview";
 		const sessionModelFlag = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : fallbackModel;
 
@@ -380,9 +388,27 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			// Kill the child process when the user presses Escape (abort signal fires)
-			const onAbort = () => {
+			let wasTimedOut = false;
+			const timeoutTimer = setTimeout(() => {
+				wasTimedOut = true;
 				clearInterval(state.timer);
 				proc.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 5000);
+				state.status = "timeout";
+				state.lastLine = `Timed out after ${Math.round(agentTimeoutMs / 1000)}s`;
+				state.runningModel = undefined;
+				updateWidget();
+			}, agentTimeoutMs);
+
+			const onAbort = () => {
+				clearTimeout(timeoutTimer);
+				clearInterval(state.timer);
+				proc.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 5000);
 				state.status = "cancelled";
 				state.lastLine = "Cancelled by user";
 				state.runningModel = undefined;
@@ -436,6 +462,7 @@ export default function (pi: ExtensionAPI) {
 
 			proc.on("close", (code) => {
 				signal?.removeEventListener("abort", onAbort);
+				clearTimeout(timeoutTimer);
 
 				if (buffer.trim()) {
 					try {
@@ -450,6 +477,21 @@ export default function (pi: ExtensionAPI) {
 				clearInterval(state.timer);
 				state.elapsed = Date.now() - startTime;
 				state.runningModel = undefined;
+				const full = textChunks.join("");
+
+				if (wasTimedOut) {
+					state.status = "timeout";
+					state.lastLine = `Timed out after ${Math.round(agentTimeoutMs / 1000)}s`;
+					updateWidget();
+					resolve({
+						output: full,
+						exitCode: 1,
+						elapsed: state.elapsed,
+						model,
+						timedOut: true,
+					});
+					return;
+				}
 
 				// If we were aborted, the onAbort handler already set state to error.
 				// Don't overwrite it with a successful close. Use exitCode: -1 as
@@ -468,8 +510,6 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				state.status = code === 0 ? "done" : "error";
-
-				const full = textChunks.join("");
 				state.lastLine = full.split("\n").filter((l: string) => l.trim()).pop() || "";
 				updateWidget();
 
@@ -488,7 +528,7 @@ export default function (pi: ExtensionAPI) {
 
 				ctx.ui.notify(
 					`${displayName(state.def.name)} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
-					state.status === "done" ? "success" : "error"
+					state.status === "done" ? "success" : state.status === "timeout" ? "warning" : "error"
 				);
 
 				resolve({
@@ -501,6 +541,7 @@ export default function (pi: ExtensionAPI) {
 
 			proc.on("error", (err) => {
 				signal?.removeEventListener("abort", onAbort);
+				clearTimeout(timeoutTimer);
 				clearInterval(state.timer);
 				state.status = "error";
 				state.runningModel = undefined;
@@ -552,13 +593,17 @@ You may optionally pass a \`model\` field per query to override the expert's def
 					model: Type.Optional(Type.String({
 						description: "Override the model for this query. Format: provider/id (e.g. ollama-cloud/qwen3-coder-next). Uses expert default, session override, or session model if omitted.",
 					})),
+					timeout: Type.Optional(Type.Number({
+						minimum: 1,
+						description: "Override the timeout for this query in seconds. Uses expert default (from .md frontmatter) or 60s if omitted.",
+					})),
 				}),
 				{ description: "Array of expert queries to run in parallel" },
 			),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const { queries } = params as { queries: { expert: string; question: string; model?: string }[] };
+			const { queries } = params as { queries: { expert: string; question: string; model?: string; timeout?: number }[] };
 
 			if (!queries || queries.length === 0) {
 				return {
@@ -578,8 +623,8 @@ You may optionally pass a \`model\` field per query to override the expert's def
 			// Launch ALL experts concurrently — allSettled so one failure
 			// never discards results from the others
 			const settled = await Promise.allSettled(
-				queries.map(async ({ expert, question, model }) => {
-					const result = await queryExpert(expert, question, ctx, model, signal);
+				queries.map(async ({ expert, question, model, timeout }) => {
+					const result = await queryExpert(expert, question, ctx, model, signal, timeout);
 					const expertKey = expert.toLowerCase().replace(/\s+/g, "-");
 					const outputDir = join(ctx.cwd, ".pi", "outputs");
 					const outputPath = join(outputDir, `${expertKey}.md`);
@@ -590,7 +635,9 @@ You may optionally pass a \`model\` field per query to override the expert's def
 						const cutAt = idx > 0 ? idx : MAX_PREVIEW;
 						preview = result.output.slice(0, cutAt) + "\n\n... [truncated]";
 					}
-					const status = result.exitCode === 0
+					const status = result.timedOut
+						? "timeout"
+						: result.exitCode === 0
 						? "done"
 						: result.exitCode === -1
 						? "cancelled"
@@ -638,14 +685,18 @@ You may optionally pass a \`model\` field per query to override the expert's def
 			// Top-of-output summary: one line per expert showing the model that
 			// actually got used (so the user can verify set_expert_model overrides).
 			const summaryLines = results.map(r => {
-				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
+				const icon = r.status === "done" ? "✓"
+					: r.status === "cancelled" ? "⊘"
+					: r.status === "timeout" ? "⏱" : "✗";
 				const m = r.model || "?";
 				return `  ${icon} ${displayName(r.expert)} → ${m} [${r.modelTag || "unknown"}]`;
 			});
 			const summary = `### Active models\n${summaryLines.join("\n")}\n\n---\n\n`;
 
 			const sections = results.map(r => {
-				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
+				const icon = r.status === "done" ? "✓"
+					: r.status === "cancelled" ? "⊘"
+					: r.status === "timeout" ? "⏱" : "✗";
 				const modelInfo = r.model ? ` — model: ${r.model} [${r.modelTag}]` : "";
 				return `## [${icon}] ${displayName(r.expert)} (${Math.round(r.elapsed / 1000)}s)${modelInfo}\n\n${r.output}`;
 			});
@@ -692,8 +743,12 @@ You may optionally pass a \`model\` field per query to override the expert's def
 			}
 
 			const lines = (details.results as any[]).map((r: any) => {
-				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
-				const color = r.status === "done" ? "success" : r.status === "cancelled" ? "warning" : "error";
+				const icon = r.status === "done" ? "✓"
+					: r.status === "cancelled" ? "⊘"
+					: r.status === "timeout" ? "⏱" : "✗";
+				const color = r.status === "done" ? "success"
+					: r.status === "cancelled" ? "warning"
+					: r.status === "timeout" ? "warning" : "error";
 				const elapsed = typeof r.elapsed === "number" ? Math.round(r.elapsed / 1000) : 0;
 				const modelTag = r.model ? ` [${r.model}]` : "";
 				return theme.fg(color, `${icon} ${displayName(r.expert)}`) +
@@ -858,7 +913,8 @@ You may optionally pass a \`model\` field per query to override the expert's def
 			.map(s => {
 				const defaultModel = s.def.model || "session default";
 				const runtimeModel = s.runtimeModel ? `\n**Session override:** \`${s.runtimeModel}\`` : "";
-				return `### ${displayName(s.def.name)}\n**Query as:** \`${s.def.name}\`\n${s.def.description}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}\n**Default model:** \`${defaultModel}\`${runtimeModel}`;
+				const timeoutLabel = s.def.timeout ? `${s.def.timeout}s` : "default (60s)";
+				return `### ${displayName(s.def.name)}\n**Query as:** \`${s.def.name}\`\n${s.def.description}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}\n**Default model:** \`${defaultModel}\`\n**Timeout:** \`${timeoutLabel}\`${runtimeModel}`;
 			})
 			.join("\n\n");
 
@@ -876,7 +932,7 @@ You may optionally pass a \`model\` field per query to override the expert's def
 				.replace("{{EXPERT_NAMES}}", expertNames)
 				.replace("{{EXPERT_CATALOG}}", expertCatalog);
 
-			// Append instruction about model selection and retrieving outputs from disk
+			// Append instruction about model selection, timeout, and retrieving outputs from disk
 			systemPrompt +=`
 ## Model Selection
 Each expert has a default model defined in its \`.md\` file (shown above in **Default model**).
@@ -884,6 +940,10 @@ You can override the model for any individual query by adding a \`model\` field 
 You can also change the session-wide default for an expert using the \`set_expert_model\` tool.
 
 Session overrides and per-query overrides are reset when the extension reloads.
+
+## Timeout
+Each expert has a default timeout (shown in catalog). Use the \`timeout\` parameter to override per-query. Minimum 1 second.
+If an expert times out (⏱), it was killed after exceeding its timeout — retry with a shorter question or higher timeout.
 
 ## Retrieving Full Expert Outputs
 Expert responses may be summarized in tool results. When you need the complete documentation from any expert, use your built-in \`read()\` tool on the file path shown in the result (e.g. \`.pi/outputs/ext-expert.md\`). Do NOT dispatch another agent just to read a file — your native \`read()\` tool reaches the filesystem directly.`;
