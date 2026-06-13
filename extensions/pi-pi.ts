@@ -20,7 +20,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
-import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
+import { readdirSync, readFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "fs";
 import { join, resolve } from "path";
 import { applyExtensionDefaults } from "./lib/themeMap.ts";
 
@@ -47,6 +47,7 @@ interface ExpertState {
 	runtimeModel?: string; // Session-wide override chosen by the orchestrator
 	runningModel?: string; // Model currently being used (only when status === "researching")
 	timer?: ReturnType<typeof setInterval>;
+	outputPath?: string;    // Path to the most recent saved output file for this expert
 }
 
 // ── Helpers ──────────────────────────────────────
@@ -493,11 +494,11 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				// If we were aborted, the onAbort handler already set state to error.
+				// If we were aborted, the onAbort handler already set state to cancelled.
 				// Don't overwrite it with a successful close. Use exitCode: -1 as
 				// a sentinel so the execute handler can mark status="cancelled".
 				if (signal?.aborted) {
-					state.status = "error";
+					state.status = "cancelled";
 					state.lastLine = "Cancelled by user";
 					updateWidget();
 					resolve({
@@ -518,17 +519,22 @@ export default function (pi: ExtensionAPI) {
 					const outputDir = join(ctx.cwd, ".pi", "outputs");
 					if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 					const expertKey = state.def.name.toLowerCase().replace(/\s+/g, "-");
-					const outputPath = join(outputDir, `${expertKey}.md`);
+					const uniquePath = join(outputDir, `${expertKey}_${Date.now()}.md`);
 					let outputBody = full;
 					if (stderrChunks.length > 0) {
 						outputBody += "\n\n--- stderr ---\n" + stderrChunks.join("");
 					}
-					writeFileSync(outputPath, outputBody, "utf-8");
+					// Clean up previous output file for this expert to prevent accumulation
+					if (state.outputPath && existsSync(state.outputPath)) {
+						try { unlinkSync(state.outputPath); } catch {}
+					}
+					writeFileSync(uniquePath, outputBody, "utf-8");
+					state.outputPath = uniquePath;
 				} catch {}
 
 				ctx.ui.notify(
 					`${displayName(state.def.name)} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
-					state.status === "done" ? "success" : state.status === "timeout" ? "warning" : "error"
+					state.status === "done" ? "success" : state.status === "timeout" || state.status === "cancelled" ? "warning" : "error"
 				);
 
 				resolve({
@@ -626,8 +632,8 @@ You may optionally pass a \`model\` field per query to override the expert's def
 				queries.map(async ({ expert, question, model, timeout }) => {
 					const result = await queryExpert(expert, question, ctx, model, signal, timeout);
 					const expertKey = expert.toLowerCase().replace(/\s+/g, "-");
-					const outputDir = join(ctx.cwd, ".pi", "outputs");
-					const outputPath = join(outputDir, `${expertKey}.md`);
+					const expertState = experts.get(expertKey);
+					const outputPath = expertState?.outputPath || join(join(ctx.cwd, ".pi", "outputs"), `${expertKey}.md`);
 					const MAX_PREVIEW = 2500;
 					let preview = result.output;
 					if (result.output.length > MAX_PREVIEW) {
