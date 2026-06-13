@@ -1058,7 +1058,29 @@ export default function (pi: ExtensionAPI) {
 			const { agent, offset, limit } = params as { agent: string; offset?: number; limit?: number };
 			const agentKey = agent.toLowerCase().replace(/\s+/g, "-");
 			const state = agentStates.get(agentKey);
-			const outputPath = state?.outputPath || join(outputBaseDir, `${agentKey}.md`);
+			let outputPath = state?.outputPath;
+
+			if (!outputPath) {
+				// Extension may have reloaded — scan for most recent timestamped file
+				const prefix = `${agentKey}_`;
+				const suffix = ".md";
+				const candidates = readdirSync(outputBaseDir)
+					.filter((f) => f.startsWith(prefix) && f.endsWith(suffix))
+					.map((f) => {
+						const tsStr = f.slice(prefix.length, -suffix.length);
+						const ts = parseInt(tsStr, 10);
+						return { file: f, ts: isNaN(ts) ? 0 : ts };
+					})
+					.filter((c) => c.ts > 0)
+					.sort((a, b) => b.ts - a.ts);
+				if (candidates.length > 0) {
+					outputPath = join(outputBaseDir, candidates[0].file);
+				}
+			}
+
+			if (!outputPath) {
+				outputPath = join(outputBaseDir, `${agentKey}.md`);
+			}
 
 			if (!existsSync(outputPath)) {
 				return {
