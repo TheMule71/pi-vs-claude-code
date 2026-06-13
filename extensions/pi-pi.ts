@@ -949,7 +949,13 @@ Session overrides and per-query overrides are reset when the extension reloads.
 
 ## Timeout
 Each expert has a default timeout (shown in catalog). Use the \`timeout\` parameter to override per-query. Minimum 1 second.
-If an expert times out (⏱), it was killed after exceeding its timeout — retry with a shorter question or higher timeout.
+If an expert times out (⏱), it receives SIGTERM first, then SIGKILL after a 5-second grace period — retry with a shorter question or higher timeout.
+
+## Cancellation
+If the user interrupts a parallel query, running experts are killed with SIGTERM → SIGKILL after 5 seconds; queued experts are cancelled before they start.
+
+## Filesystem
+All experts share the same working directory and filesystem. Concurrent experts may race on shared files — direct them to use unique temporary filenames if isolation is needed.
 
 ## Retrieving Full Expert Outputs
 Expert responses may be summarized in tool results. When you need the complete documentation from any expert, use your built-in \`read()\` tool on the file path shown in the result (e.g. \`.pi/outputs/ext-expert.md\`). Do NOT dispatch another agent just to read a file — your native \`read()\` tool reaches the filesystem directly.`;
