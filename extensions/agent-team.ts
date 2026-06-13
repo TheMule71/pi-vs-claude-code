@@ -599,6 +599,10 @@ export default function (pi: ExtensionAPI) {
 					if (stderrChunks.length > 0) {
 						outputBody += "\n\n--- stderr ---\n" + stderrChunks.join("");
 					}
+					// Clean up previous output file for this agent to prevent accumulation
+					if (state.outputPath && existsSync(state.outputPath)) {
+						try { unlinkSync(state.outputPath); } catch {}
+					}
 					writeFileSync(uniquePath, outputBody, "utf-8");
 					state.outputPath = uniquePath;
 				} catch {}
