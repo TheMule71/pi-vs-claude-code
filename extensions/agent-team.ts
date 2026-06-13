@@ -428,14 +428,20 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			// Kill the child process when the user presses Escape (abort signal fires)
-			const onAbort = () => {
+			let wasAborted = false;
+			const killProc = () => {
+				wasAborted = true;
 				clearInterval(state.timer);
 				proc.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 5000);
 				state.status = "error";
 				state.lastWork = "Cancelled by user";
 				updateWidget();
 			};
-			signal?.addEventListener("abort", onAbort, { once: true });
+			if (signal?.aborted) killProc();
+			else signal?.addEventListener("abort", killProc, { once: true });
 
 			let buffer = "";
 
@@ -496,7 +502,7 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("close", (code) => {
-				signal?.removeEventListener("abort", onAbort);
+				signal?.removeEventListener("abort", killProc);
 
 				if (buffer.trim()) {
 					try {
@@ -511,7 +517,7 @@ export default function (pi: ExtensionAPI) {
 				clearInterval(state.timer);
 				state.elapsed = Date.now() - startTime;
 
-				if (signal?.aborted) {
+				if (wasAborted) {
 					state.status = "error";
 					state.lastWork = "Cancelled by user";
 					updateWidget();
@@ -554,7 +560,7 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("error", (err) => {
-				signal?.removeEventListener("abort", onAbort);
+				signal?.removeEventListener("abort", killProc);
 				clearInterval(state.timer);
 				state.status = "error";
 				state.lastWork = `Error: ${err.message}`;
@@ -566,6 +572,30 @@ export default function (pi: ExtensionAPI) {
 				});
 			});
 		});
+	}
+
+	// ── Concurrency helper ───────────────────────
+
+	async function mapWithConcurrencyLimit<TIn, TOut>(
+		items: TIn[],
+		concurrency: number,
+		fn: (item: TIn, index: number) => Promise<TOut>,
+	): Promise<TOut[]> {
+		if (items.length === 0) return [];
+		const limit = Math.max(1, Math.min(concurrency, items.length));
+		const results: TOut[] = new Array(items.length);
+		let nextIndex = 0;
+
+		const workers = new Array(limit).fill(null).map(async () => {
+			while (true) {
+				const current = nextIndex++;
+				if (current >= items.length) return;
+				results[current] = await fn(items[current], current);
+			}
+		});
+
+		await Promise.all(workers);
+		return results;
 	}
 
 	// ── dispatch_agent Tool (registered at top level) ──
@@ -680,6 +710,227 @@ export default function (pi: ExtensionAPI) {
 					? details.fullOutput.slice(0, 12000) + "\n... [truncated]"
 					: details.fullOutput;
 				return new Text(header + "\n" + theme.fg("muted", output), 0, 0);
+			}
+
+			return new Text(header, 0, 0);
+		},
+	});
+
+	// ── dispatch_agents Tool (plural, controlled concurrency) ──
+
+	pi.registerTool({
+		name: "dispatch_agents",
+		label: "Dispatch Agents",
+		description: `Dispatch multiple specialist agents with controlled concurrency. Agents are executed in the order provided, but up to \`concurrency\` agents may run simultaneously.\n\nUse this when you need to run multiple agents at once while respecting API provider limits. Order is preserved — results are returned in the same order as the input array.\n\nFor a single agent, use \`dispatch_agent\` instead.`,
+
+		parameters: Type.Object({
+			agents: Type.Array(
+				Type.Object({
+					agent: Type.String({ description: "Agent name (case-insensitive)" }),
+					task: Type.String({ description: "Task description for the agent to execute" }),
+					model: Type.Optional(Type.String({ description: "Override the model for this dispatch. Format: provider/id (e.g. google/gemini-2.5-pro). Uses agent default or session model if omitted." })),
+				}),
+				{ description: "Array of agent tasks. Executed in order with controlled concurrency. Minimum 1 item.", minItems: 1 },
+			),
+			concurrency: Type.Optional(Type.Number({
+				description: "Maximum number of agents to run simultaneously. Default: 3. Order is preserved regardless of this value.",
+				default: 3,
+				minimum: 1,
+			})),
+		}),
+
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const { agents, concurrency } = params as {
+				agents: { agent: string; task: string; model?: string }[];
+				concurrency?: number;
+			};
+
+			if (!agents || agents.length === 0) {
+				return {
+					content: [{ type: "text", text: "No agents provided." }],
+					details: { results: [], status: "error" },
+				};
+			}
+
+			const maxConcurrency = Math.max(1, Math.min(concurrency ?? 3, agents.length));
+
+			const allResults: Array<{
+				agent: string;
+				task: string;
+				status: "done" | "error" | "cancelled";
+				elapsed: number;
+				exitCode: number;
+				output: string;
+				fullOutput: string;
+				outputPath: string;
+				modelUsed: string;
+			} | null> = new Array(agents.length).fill(null);
+
+			const emitUpdate = () => {
+				if (!onUpdate) return;
+				const done = allResults.filter(r => r !== null).length;
+				const running = agents.length - done;
+				onUpdate({
+					content: [{ type: "text", text: `Dispatch: ${done}/${agents.length} done, ${running} running (max ${maxConcurrency} concurrent)...` }],
+					details: { results: allResults.filter(r => r !== null), total: agents.length, concurrency: maxConcurrency, status: "dispatching" },
+				});
+			};
+
+			const runResults = await mapWithConcurrencyLimit(agents, maxConcurrency, async (config, idx) => {
+				if (signal?.aborted) {
+					const cancelledResult = {
+						agent: config.agent,
+						task: config.task,
+						status: "cancelled" as const,
+						elapsed: 0,
+						exitCode: -1,
+						output: "Cancelled by user",
+						fullOutput: "",
+						outputPath: "",
+						modelUsed: "",
+					};
+					allResults[idx] = cancelledResult;
+					emitUpdate();
+					return cancelledResult;
+				}
+
+				// Resolve model label for display
+				const fallbackModel = "openrouter/google/gemini-3-flash-preview";
+				const sessionModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : fallbackModel;
+				const resolvedModel = config.model || agentStates.get(config.agent.toLowerCase())?.def.model || sessionModel;
+				const modelUsed = resolvedModel === sessionModel ? "default" : stripProvider(resolvedModel);
+
+				try {
+					const result = await dispatchAgent(config.agent, config.task, ctx, config.model, signal);
+
+					const agentKey = config.agent.toLowerCase().replace(/\s+/g, "-");
+					const outputPath = join(outputBaseDir, `${agentKey}.md`);
+
+					const MAX_PREVIEW = 2500;
+					let preview = result.output;
+					if (result.output.length > MAX_PREVIEW) {
+						const cutIdx = result.output.lastIndexOf("\n", MAX_PREVIEW);
+						const cutAt = cutIdx > 0 ? cutIdx : MAX_PREVIEW;
+						preview = result.output.slice(0, cutAt) + "\n\n... [truncated]";
+					}
+
+					const status = result.exitCode === 0 ? "done" : "error";
+					const resultObj = {
+						agent: config.agent,
+						task: config.task,
+						status,
+						elapsed: result.elapsed,
+						exitCode: result.exitCode,
+						output: `${preview}\n\n[Full output: ${outputPath}]`,
+						fullOutput: result.output,
+						outputPath,
+						modelUsed,
+					};
+
+					allResults[idx] = resultObj;
+					emitUpdate();
+					return resultObj;
+				} catch (err: any) {
+					const status = signal?.aborted ? "cancelled" : "error";
+					const resultObj = {
+						agent: config.agent,
+						task: config.task,
+						status: status as "cancelled" | "error",
+						elapsed: 0,
+						exitCode: 1,
+						output: signal?.aborted ? "Cancelled by user" : `Error: ${err?.message || err}`,
+						fullOutput: "",
+						outputPath: "",
+						modelUsed,
+					};
+
+					allResults[idx] = resultObj;
+					emitUpdate();
+					return resultObj;
+				}
+			});
+
+			const finalStatus = signal?.aborted
+				? "cancelled"
+				: runResults.every(r => r.status === "done")
+				? "done"
+				: "partial";
+
+			// Build combined response
+			const summaryLines = runResults.map(r => {
+				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
+				return `  ${icon} ${displayName(r.agent)} (${Math.round(r.elapsed / 1000)}s) [${r.modelUsed}]`;
+			});
+			const summary = `### Dispatch Results\n${summaryLines.join("\n")}\n\n---\n\n`;
+
+			const sections = runResults.map(r => {
+				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
+				const modelInfo = r.modelUsed ? ` — model: ${r.modelUsed}` : "";
+				return `## [${icon}] ${displayName(r.agent)} (${Math.round(r.elapsed / 1000)}s)${modelInfo}\n\n${r.output}`;
+			});
+
+			return {
+				content: [{ type: "text", text: summary + sections.join("\n\n---\n\n") }],
+				details: {
+					results: runResults,
+					status: finalStatus,
+					concurrency: maxConcurrency,
+					total: agents.length,
+				},
+			};
+		},
+
+		renderCall(args, theme) {
+			const items = (args as any).agents || [];
+			const names = items.map((a: any) => displayName(a.agent || "?")).join(", ");
+			const concurrency = (args as any).concurrency;
+			const concurrencyHint = typeof concurrency === "number" ? ` (max ${concurrency} concurrent)` : "";
+			return new Text(
+				theme.fg("toolTitle", theme.bold("dispatch_agents ")) +
+				theme.fg("accent", `${items.length} agent${items.length === 1 ? "" : "s"}`) +
+				theme.fg("dim", " — ") +
+				theme.fg("muted", names + concurrencyHint),
+				0, 0,
+			);
+		},
+
+		renderResult(result, options, theme) {
+			const details = result.details as any;
+			if (!details?.results) {
+				const text = result.content[0];
+				return new Text(text?.type === "text" ? text.text : "", 0, 0);
+			}
+
+			if (options.isPartial || details.status === "dispatching") {
+				const done = details.results?.length || 0;
+				const total = details.total || done;
+				return new Text(
+					theme.fg("accent", `◉ ${done}/${total} agents`) +
+					theme.fg("dim", ` dispatching (max ${details.concurrency || "?"} concurrent)...`),
+					0, 0,
+				);
+			}
+
+			const lines = (details.results as any[]).map((r: any) => {
+				const icon = r.status === "done" ? "✓" : r.status === "cancelled" ? "⊘" : "✗";
+				const color = r.status === "done" ? "success" : r.status === "cancelled" ? "warning" : "error";
+				const elapsed = typeof r.elapsed === "number" ? Math.round(r.elapsed / 1000) : 0;
+				const modelTag = r.modelUsed ? ` [${r.modelUsed}]` : "";
+				return theme.fg(color, `${icon} ${displayName(r.agent)}`) +
+					theme.fg("dim", ` ${elapsed}s${modelTag}`);
+			});
+
+			const header = lines.join(theme.fg("dim", " · "));
+
+			if (options.expanded && details.results) {
+				const expanded = (details.results as any[]).map((r: any) => {
+					const output = r.fullOutput
+						? (r.fullOutput.length > 12000 ? r.fullOutput.slice(0, 12000) + "\n... [truncated]" : r.fullOutput)
+						: r.output || "";
+					const modelTag = r.modelUsed ? ` — model: ${r.modelUsed}` : "";
+					return theme.fg("accent", `── ${displayName(r.agent)}${modelTag} ──`) + "\n" + theme.fg("muted", output);
+				});
+				return new Text(header + "\n\n" + expanded.join("\n\n"), 0, 0);
 			}
 
 			return new Text(header, 0, 0);
@@ -849,7 +1100,8 @@ You can ONLY dispatch to agents listed below. Do not attempt to dispatch to agen
 ## How to Work
 - Analyze the user's request and break it into clear sub-tasks
 - Choose the right agent(s) for each sub-task
-- Dispatch tasks using the dispatch_agent tool
+- Dispatch tasks using the dispatch_agent tool (single) or dispatch_agents tool (multiple)
+- When using dispatch_agents, set concurrency=1 for strict sequential order, or higher for parallel execution
 - Review results and dispatch follow-up agents if needed
 - If a task fails, try a different agent or adjust the task description
 - Summarize the outcome for the user
@@ -900,7 +1152,7 @@ ${agentCatalog}`,
 		}
 
 		// Dispatcher tools available to orchestrator
-		pi.setActiveTools(["dispatch_agent", "read_agent_output"]);
+		pi.setActiveTools(["dispatch_agent", "dispatch_agents", "read_agent_output"]);
 
 		_ctx.ui.setStatus("agent-team", `Team: ${activeTeamName} (${agentStates.size})`);
 		const members = Array.from(agentStates.values()).map(s => displayName(s.def.name)).join(", ");
