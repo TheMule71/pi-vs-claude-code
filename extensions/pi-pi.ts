@@ -33,7 +33,7 @@ interface ExpertDef {
 	extensions: string[];
 	systemPrompt: string;
 	model?: string;      // Optional per-expert model defined in .md frontmatter
-	timeout?: number;    // Optional per-expert timeout in seconds (default: 60)
+	timeout?: number;    // Optional per-expert timeout in seconds (default: 300)
 	file: string;
 }
 
@@ -351,7 +351,7 @@ export default function (pi: ExtensionAPI) {
 			updateWidget();
 		}, 1000);
 
-		const DEFAULT_EXPERT_TIMEOUT_S = 60;
+		const DEFAULT_EXPERT_TIMEOUT_S = 300;
 		const agentTimeoutMs = (timeoutOverride || state.def.timeout || DEFAULT_EXPERT_TIMEOUT_S) * 1000;
 
 		const fallbackModel = "openrouter/google/gemini-3-flash-preview";
@@ -601,7 +601,7 @@ You may optionally pass a \`model\` field per query to override the expert's def
 					})),
 					timeout: Type.Optional(Type.Number({
 						minimum: 1,
-						description: "Override the timeout for this query in seconds. Uses expert default (from .md frontmatter) or 60s if omitted.",
+						description: "Override the timeout for this query in seconds. Uses expert default (from .md frontmatter) or 300s if omitted.",
 					})),
 				}),
 				{ description: "Array of expert queries to run in parallel" },
@@ -919,7 +919,7 @@ You may optionally pass a \`model\` field per query to override the expert's def
 			.map(s => {
 				const defaultModel = s.def.model || "session default";
 				const runtimeModel = s.runtimeModel ? `\n**Session override:** \`${s.runtimeModel}\`` : "";
-				const timeoutLabel = s.def.timeout ? `${s.def.timeout}s` : "default (60s)";
+				const timeoutLabel = s.def.timeout ? `${s.def.timeout}s` : "default (300s)";
 				return `### ${displayName(s.def.name)}\n**Query as:** \`${s.def.name}\`\n${s.def.description}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}\n**Default model:** \`${defaultModel}\`\n**Timeout:** \`${timeoutLabel}\`${runtimeModel}`;
 			})
 			.join("\n\n");

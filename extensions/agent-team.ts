@@ -34,7 +34,7 @@ interface AgentDef {
 	extensions: string[];
 	systemPrompt: string;
 	model?: string;      // Optional per-agent model override (e.g. "google/gemini-2.5-pro")
-	timeout?: number;    // Optional per-agent timeout in seconds (default: 60)
+	timeout?: number;    // Optional per-agent timeout in seconds (default: 300)
 	file: string;
 }
 
@@ -398,7 +398,7 @@ export default function (pi: ExtensionAPI) {
 		state.runCount++;
 		updateWidget();
 
-		const DEFAULT_AGENT_TIMEOUT_S = 60;
+		const DEFAULT_AGENT_TIMEOUT_S = 300;
 		const agentTimeoutMs = (timeoutOverride || state.def.timeout || DEFAULT_AGENT_TIMEOUT_S) * 1000;
 
 		const startTime = Date.now();
@@ -670,7 +670,7 @@ export default function (pi: ExtensionAPI) {
 			agent: Type.String({ description: "Agent name (case-insensitive)" }),
 			task: Type.String({ description: "Task description for the agent to execute" }),
 			model: Type.Optional(Type.String({ description: "Override the model for this dispatch. Format: provider/id (e.g. google/gemini-2.5-pro). Uses agent default or session model if omitted." })),
-			timeout: Type.Optional(Type.Number({ minimum: 1, description: "Override the timeout for this dispatch in seconds. Uses agent default (from .md frontmatter) or 60s if omitted." })),
+			timeout: Type.Optional(Type.Number({ minimum: 1, description: "Override the timeout for this dispatch in seconds. Uses agent default (from .md frontmatter) or 300s if omitted." })),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -794,7 +794,7 @@ export default function (pi: ExtensionAPI) {
 					agent: Type.String({ description: "Agent name (case-insensitive)" }),
 					task: Type.String({ description: "Task description for the agent to execute" }),
 					model: Type.Optional(Type.String({ description: "Override the model for this dispatch. Format: provider/id (e.g. google/gemini-2.5-pro). Uses agent default or session model if omitted." })),
-					timeout: Type.Optional(Type.Number({ minimum: 1, description: "Override the timeout for this agent in seconds. Uses agent default or 60s if omitted." })),
+					timeout: Type.Optional(Type.Number({ minimum: 1, description: "Override the timeout for this agent in seconds. Uses agent default or 300s if omitted." })),
 				}),
 				{ description: "Array of agent tasks. Executed in order with controlled concurrency. Minimum 1 item.", minItems: 1 },
 			),
@@ -1221,7 +1221,7 @@ export default function (pi: ExtensionAPI) {
 		const agentCatalog = Array.from(agentStates.values())
 			.map(s => {
 				const modelLabel = s.def.model ? stripProvider(s.def.model) : "default";
-				const timeoutLabel = s.def.timeout ? `${s.def.timeout}s` : "default (60s)";
+				const timeoutLabel = s.def.timeout ? `${s.def.timeout}s` : "default (300s)";
 				return `### ${displayName(s.def.name)}\n**Dispatch as:** \`${s.def.name}\`\n${s.def.description}\n**Tools:** ${s.def.tools}${s.def.extensions.length ? `\n**Extensions:** ${s.def.extensions.join(", ")}` : ""}\n**Model:** \`${modelLabel}\`\n**Timeout:** \`${timeoutLabel}\``;
 			})
 			.join("\n\n");
