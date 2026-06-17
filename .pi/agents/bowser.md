@@ -1,7 +1,7 @@
 ---
 name: bowser
 description: Headless browser automation agent using Playwright CLI. Use when you need headless browsing, parallel browser sessions, UI testing, screenshots, or web scraping. Supports parallel instances. Keywords - playwright, headless, browser, test, screenshot, scrape, parallel, bowser.
-model: ollama-cloud/opus
+model: ollama-cloud/glm-5.2
 color: orange
 skills:
   - playwright-bowser
