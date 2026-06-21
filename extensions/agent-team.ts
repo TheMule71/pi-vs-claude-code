@@ -274,7 +274,7 @@ export default function (pi: ExtensionAPI) {
 		const statusVisible = 1 + statusStr.length + timeStr.length;
 
 		// Context bar: 5 blocks + percent
-		const filled = Math.ceil(state.contextPct / 20);
+		const filled = Math.max(0, Math.min(5, Math.ceil(state.contextPct / 20)));
 		const bar = "#".repeat(filled) + "-".repeat(5 - filled);
 		const ctxStr = `[${bar}] ${Math.ceil(state.contextPct)}%`;
 		const ctxLine = theme.fg("dim", ctxStr);

@@ -997,7 +997,7 @@ Expert responses may be summarized in tool results. When you need the complete d
 				const model = _ctx.model?.id || "no-model";
 				const usage = _ctx.getContextUsage();
 				const pct = usage ? usage.percent : 0;
-				const filled = Math.round(pct / 10);
+				const filled = Math.max(0, Math.min(10, Math.round(pct / 10)));
 				const bar = "#".repeat(filled) + "-".repeat(10 - filled);
 
 				const active = Array.from(experts.values()).filter(e => e.status === "researching").length;
