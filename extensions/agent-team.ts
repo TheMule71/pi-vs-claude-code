@@ -21,7 +21,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text, type AutocompleteItem, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
-import { readdirSync, readFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "fs";
+import { readdirSync, readFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync, realpathSync } from "fs";
 import { join, resolve } from "path";
 import { applyExtensionDefaults } from "./lib/themeMap.ts";
 
@@ -35,6 +35,15 @@ interface AgentDef {
 	systemPrompt: string;
 	model?: string;      // Optional per-agent model override (e.g. "google/gemini-2.5-pro")
 	timeout?: number;    // Optional per-agent timeout in seconds (default: 300)
+	file: string;
+}
+
+interface OrchestratorDef {
+	name: string;
+	description: string;
+	tools: string[];
+	whitelist: string[];
+	systemPrompt: string;
 	file: string;
 }
 
@@ -67,6 +76,43 @@ function stripProvider(modelId?: string): string {
 }
 
 // ── Teams YAML Parser ────────────────────────────
+
+function resolveWhitelistedPath(inputPath: string, cwd: string, whitelist: string[]): { allowed: boolean; resolvedPath?: string; reason?: string } {
+	const normalizedInput = inputPath.trim();
+	if (normalizedInput.startsWith("/") || /^[A-Za-z]:[\\/]/.test(normalizedInput)) {
+		return { allowed: false, reason: "Absolute paths are not allowed." };
+	}
+	if (normalizedInput.includes("..")) {
+		return { allowed: false, reason: "Path traversal ('..') is not allowed." };
+	}
+
+	let resolvedTarget: string;
+	try {
+		resolvedTarget = realpathSync(resolve(cwd, normalizedInput));
+	} catch {
+		return { allowed: false, reason: `File does not exist or cannot be resolved: ${inputPath}` };
+	}
+
+	for (const dir of whitelist) {
+		if (!dir.trim()) continue;
+		let resolvedDir: string;
+		try {
+			resolvedDir = realpathSync(resolve(cwd, dir.trim()));
+		} catch {
+			continue; // whitelisted dir doesn't exist yet, skip
+		}
+		// Ensure the resolved target is inside (or equal to) the whitelisted dir
+		if (
+			resolvedTarget === resolvedDir ||
+			resolvedTarget.startsWith(resolvedDir + "/") ||
+			resolvedTarget.startsWith(resolvedDir + "\\")
+		) {
+			return { allowed: true, resolvedPath: resolvedTarget };
+		}
+	}
+
+	return { allowed: false, reason: `Path '${inputPath}' is outside the allowed directories.` };
+}
 
 function parseTeamsYaml(raw: string): Record<string, string[]> {
 	const teams: Record<string, string[]> = {};
@@ -121,6 +167,44 @@ function parseAgentFile(filePath: string): AgentDef | null {
 	}
 }
 
+function parseOrchestratorFile(filePath: string): OrchestratorDef | null {
+	try {
+		const raw = readFileSync(filePath, "utf-8");
+		const match = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+		if (!match) return null;
+
+		const frontmatter: Record<string, string> = {};
+		for (const line of match[1].split("\n")) {
+			const idx = line.indexOf(":");
+			if (idx > 0) {
+				frontmatter[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+			}
+		}
+
+		if (!frontmatter.name) return null;
+
+		const parseList = (raw?: string) =>
+			(raw || "")
+				.split(",")
+				.map((s) => s.trim())
+				.filter(Boolean);
+
+		return {
+			name: frontmatter.name,
+			description: frontmatter.description || "",
+			tools: parseList(frontmatter.tools),
+			whitelist: parseList(frontmatter.whitelist),
+			systemPrompt: match[2].trim(),
+			file: filePath,
+		};
+	} catch {
+		return null;
+	}
+}
+
+const DEFAULT_ORCHESTRATOR_TOOLS = ["dispatch_agent", "dispatch_agents", "read_agent_output"];
+const DEFAULT_ORCHESTRATOR_WHITELIST: string[] = [];
+
 function scanAgentDirs(cwd: string): AgentDef[] {
 	const dirs = [
 		join(cwd, "agents"),
@@ -136,6 +220,7 @@ function scanAgentDirs(cwd: string): AgentDef[] {
 		try {
 			for (const file of readdirSync(dir)) {
 				if (!file.endsWith(".md")) continue;
+				if (file === "agent-team-orchestrator.md") continue; // orchestrator config, not an agent
 				const fullPath = resolve(dir, file);
 				const def = parseAgentFile(fullPath);
 				if (def && !seen.has(def.name.toLowerCase())) {
@@ -162,6 +247,7 @@ function resolveExtPath(ext: string, cwd: string): string {
 export default function (pi: ExtensionAPI) {
 	const agentStates: Map<string, AgentState> = new Map();
 	let allAgentDefs: AgentDef[] = [];
+	let orchestratorDef: OrchestratorDef | null = null;
 	let teams: Record<string, string[]> = {};
 	let activeTeamName = "";
 	let gridCols = 2;
@@ -183,6 +269,10 @@ export default function (pi: ExtensionAPI) {
 
 		// Load all agent definitions
 		allAgentDefs = scanAgentDirs(cwd);
+
+		// Load orchestrator definition (optional)
+		const orchestratorPath = join(cwd, ".pi", "agents", "agent-team-orchestrator.md");
+		orchestratorDef = existsSync(orchestratorPath) ? parseOrchestratorFile(orchestratorPath) : null;
 
 		// Load teams from .pi/agents/teams.yaml
 		const teamsPath = join(cwd, ".pi", "agents", "teams.yaml");
@@ -1146,6 +1236,83 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ── read_team_doc Tool ───────────────────────────
+
+	pi.registerTool({
+		name: "read_team_doc",
+		label: "Read Team Document",
+		description: "Read a file from the orchestrator's whitelisted project directories (e.g., docs, findings, wiki, agent outputs). Use this to inspect documents produced by agents or shared knowledge bases without dispatching an agent. Supports offset/limit for large files.",
+		parameters: Type.Object({
+			path: Type.String({ description: "Relative path within a whitelisted directory, e.g., ./docs/report.md or findings/summary.md" }),
+			offset: Type.Optional(Type.Number({ minimum: 1, description: "1-based line number to start reading from. Defaults to 1 (beginning)." })),
+			limit: Type.Optional(Type.Number({ minimum: 1, description: "Maximum number of lines to read. Defaults to all lines from offset to end." })),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const { path: inputPath, offset, limit } = params as { path: string; offset?: number; limit?: number };
+			const cwd = _ctx.cwd;
+			const whitelist = orchestratorDef?.whitelist || DEFAULT_ORCHESTRATOR_WHITELIST;
+
+			const check = resolveWhitelistedPath(inputPath, cwd, whitelist);
+			if (!check.allowed) {
+				return {
+					content: [{ type: "text", text: `Cannot read "${inputPath}": ${check.reason}` }],
+					details: { path: inputPath, allowed: false, reason: check.reason },
+				};
+			}
+
+			const outputPath = check.resolvedPath!;
+			let full = readFileSync(outputPath, "utf-8");
+			const totalLines = full.split("\n").length;
+			const hasRange = offset !== undefined || limit !== undefined;
+
+			let result: string;
+			let truncated: boolean;
+			if (hasRange) {
+				const sliced = sliceOutput(full, offset, limit);
+				truncated = Buffer.byteLength(sliced, "utf-8") > OUTPUT_MAX_BYTES;
+				result = truncated ? truncateOutput(sliced) : sliced;
+			} else {
+				truncated = Buffer.byteLength(full, "utf-8") > OUTPUT_MAX_BYTES;
+				result = truncated ? truncateOutput(full) : full;
+			}
+
+			return {
+				content: [{ type: "text", text: result }],
+				details: { path: inputPath, outputPath, found: true, truncated, totalLines, offset, limit },
+			};
+		},
+
+		renderCall(args, theme) {
+			const a = args as any;
+			const p = a.path || "?";
+			return new Text(
+				theme.fg("toolTitle", theme.bold("read_team_doc ")) +
+				theme.fg("accent", p),
+				0, 0,
+			);
+		},
+
+		renderResult(result, options, theme) {
+			const details = (result.details || {}) as any;
+			if (options.isPartial) {
+				return new Text(theme.fg("accent", "● read_team_doc") + theme.fg("dim", " working..."), 0, 0);
+			}
+			const text = result.content[0];
+			if (!details.found) {
+				return new Text(theme.fg("error", `✗ ${details.path || "?"} — ${details.reason || "not allowed"}`), 0, 0);
+			}
+			const rangeInfo = details.offset || details.limit
+				? ` L${details.offset || 1}${details.limit ? `-L${(details.offset || 1) + details.limit - 1}` : ""}${details.totalLines ? `/${details.totalLines}` : ""}`
+				: details.totalLines ? ` (${details.totalLines} lines)` : "";
+			if (options.expanded && text?.type === "text") {
+				const output = truncateRender(text.text, 12000);
+				return new Text(theme.fg("success", `✓ ${details.path}${rangeInfo}`) + "\n" + theme.fg("muted", output), 0, 0);
+			}
+			return new Text(theme.fg("success", `✓ ${details.path}`) + theme.fg("dim", `${rangeInfo} loaded`), 0, 0);
+		},
+	});
+
 	// ── Commands ─────────────────────────────────
 
 	pi.registerCommand("agents-team", {
@@ -1228,8 +1395,12 @@ export default function (pi: ExtensionAPI) {
 
 		const teamMembers = Array.from(agentStates.values()).map(s => displayName(s.def.name)).join(", ");
 
-		return {
-			systemPrompt: `You are a dispatcher agent. You coordinate specialist agents to accomplish tasks.
+		const whitelistDirs = orchestratorDef?.whitelist || DEFAULT_ORCHESTRATOR_WHITELIST;
+		const whitelistStr = whitelistDirs.length > 0
+			? whitelistDirs.map(d => `- \`${d}\``).join("\n")
+			: "(none configured)";
+
+		const fallbackPrompt = `You are a dispatcher agent. You coordinate specialist agents to accomplish tasks.
 You do NOT have direct access to the codebase. You MUST delegate all work through
 agents using the dispatch_agent tool.
 
@@ -1263,8 +1434,16 @@ You can ONLY dispatch to agents listed below. Do not attempt to dispatch to agen
 
 ## Agents
 
-${agentCatalog}`,
-		};
+${agentCatalog}`;
+
+		const basePrompt = orchestratorDef?.systemPrompt || fallbackPrompt;
+		const systemPrompt = basePrompt
+			.replace(/{{TEAM_NAME}}/g, activeTeamName)
+			.replace(/{{TEAM_MEMBERS}}/g, teamMembers)
+			.replace(/{{AGENT_CATALOG}}/g, agentCatalog)
+			.replace(/{{WHITELIST}}/g, whitelistStr);
+
+		return { systemPrompt };
 	});
 
 	// ── Session Start ────────────────────────────
@@ -1297,7 +1476,8 @@ ${agentCatalog}`,
 		}
 
 		// Dispatcher tools available to orchestrator
-		pi.setActiveTools(["dispatch_agent", "dispatch_agents", "read_agent_output"]);
+		const activeTools = orchestratorDef?.tools?.length > 0 ? orchestratorDef.tools : DEFAULT_ORCHESTRATOR_TOOLS;
+		pi.setActiveTools(activeTools);
 
 		_ctx.ui.setStatus("agent-team", `Team: ${activeTeamName} (${agentStates.size})`);
 		const members = Array.from(agentStates.values()).map(s => displayName(s.def.name)).join(", ");
